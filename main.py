@@ -1,9 +1,6 @@
-#!/usr/bin/env python3
-"""
-Audio Converter Bot - main.py (English Version)
-Uses Pyrogram + aiohttp + Motor (MongoDB) to accept media, probe audio tracks,
-convert selected track(s) with optional watermark mixing, and upload result.
-"""
+#Audio Converter Bot - main.py (English Version)
+# Uses Pyrogram + aiohttp + Motor (MongoDB) to accept media, probe audio tracks,
+# convert selected track(s) with optional watermark mixing, and upload result#
 
 import os
 import re
@@ -31,7 +28,7 @@ from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, 
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s - %(levelname)s] - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s - %(levelname)s] - %(message)s')
 LOGGER = logging.getLogger(__name__)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
@@ -60,6 +57,21 @@ class Config:
     PROGRESS_UPDATE_INTERVAL = float(os.environ.get("PROGRESS_UPDATE_INTERVAL", 2.0))
     # Force owner watermark by default
     OWNER_WATERMARK_MANDATORY = os.environ.get("OWNER_WATERMARK_MANDATORY", "1") == "1"
+
+# -------------------------------------------------------------------------------- #
+# STARTUP CHECKS
+# -------------------------------------------------------------------------------- #
+def check_ffmpeg_available():
+    ff = shutil.which("ffmpeg")
+    fp = shutil.which("ffprobe")
+    if not ff or not fp:
+        LOGGER.critical("ffmpeg or ffprobe not found in PATH. Conversions will fail. Please install ffmpeg.")
+        return False
+    LOGGER.info(f"ffmpeg found: {ff}, ffprobe found: {fp}")
+    return True
+
+# Call immediately
+check_ffmpeg_available()
 
 # Validate
 required_vars = [
@@ -185,19 +197,43 @@ async def remove_admin(user_id: int):
 # -------------------------------------------------------------------------------- #
 
 async def admin_filter_func(_, __, message_or_query):
-    user_id = None
-    if isinstance(message_or_query, CallbackQuery):
-        user_id = message_or_query.from_user.id
-    elif isinstance(message_or_query, Message):
-        user_id = message_or_query.from_user.id
-    else:
-        user_id = getattr(message_or_query, 'from_user', None).id if getattr(message_or_query, 'from_user', None) else None
+    """
+    Returns True if user is owner or present in admins collection.
+    Adds logging to help debug why admin_filter might block messages.
+    """
+    try:
+        user_id = None
+        if isinstance(message_or_query, CallbackQuery):
+            user_id = message_or_query.from_user.id
+        elif isinstance(message_or_query, Message):
+            user_id = message_or_query.from_user.id
+        else:
+            user = getattr(message_or_query, 'from_user', None)
+            user_id = user.id if user else None
 
-    if user_id == Config.OWNER_ID:
-        return True
+        LOGGER.debug(f"admin_filter_func called for user_id={user_id}")
 
-    admins = await get_admin_list()
-    return user_id in admins
+        if user_id is None:
+            LOGGER.warning("admin_filter_func: could not determine user id.")
+            return False
+
+        if user_id == Config.OWNER_ID:
+            LOGGER.debug("admin_filter_func: user is OWNER => allowed")
+            return True
+
+        # Get admin list from DB and check membership
+        try:
+            admins = await get_admin_list()
+            is_admin = user_id in admins
+            LOGGER.debug(f"admin_filter_func: user {user_id} is_admin={is_admin} admins_count={len(admins)}")
+            return is_admin
+        except Exception as e:
+            LOGGER.error(f"admin_filter_func: DB error checking admin list: {e}", exc_info=True)
+            return False
+
+    except Exception as e:
+        LOGGER.error(f"admin_filter_func: unexpected error: {e}", exc_info=True)
+        return False
 
 admin_filter = filters.create(admin_filter_func)
 
@@ -644,13 +680,35 @@ async def owner_wm_pos_custom_prompt(client, cb: CallbackQuery):
     await cb.message.edit_text("🔢 Please send custom time in seconds (e.g., 1800 = 30 minutes).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="watermark_settings")]]))
 
 # Message handler for watermark uploads & custom seconds & admin watermark upload
-@bot.on_message(filters.private & (filters.audio | filters.document | filters.text) & admin_filter)
-async def message_router(client, message: Message):
+@bot.on_message(filters.private & (filters.audio | filters.video | filters.document | filters.text) & admin_filter)
+async def message_handler_router(client, message: Message):
     chat_id = message.chat.id
-    conv = await get_user_conversation(chat_id)
+    LOGGER.info(f"Incoming message from {message.from_user.id} - type audio={bool(message.audio)} video={bool(message.video)} doc={bool(message.document)} text={bool(message.text)}")
+
+    # Debug: show conversation doc for this chat
+    try:
+        conv = await get_user_conversation(chat_id)
+        LOGGER.debug(f"Conversation for chat {chat_id}: {conv}")
+    except Exception as e:
+        LOGGER.error(f"Error reading conversation for chat {chat_id}: {e}", exc_info=True)
+        conv = None
+
+    # If no conversation state, tell the user to start conversion flow
     if not conv:
+        # Do not spam owner; only guide the user
+        try:
+            await message.reply_text(
+                "🔎 I did not find an active conversion session.\n\n"
+                "Please press *Convert Audio* in the bot menu first (Audio Tools → Convert Audio),\n"
+                "then send the file you want to process.",
+                quote=True
+            )
+        except Exception as e:
+            LOGGER.warning(f"Failed to send session-missing guidance: {e}")
         return
+
     stage = conv.get("stage")
+    LOGGER.debug(f"message_handler_router: chat {chat_id} stage={stage}")
 
     if stage == "awaiting_owner_wm":
         # must be from owner
@@ -690,6 +748,27 @@ async def message_router(client, message: Message):
         except Exception:
             await message.reply_text("Please send a valid number (digits only).")
         return
+    
+    if stage == "awaiting_watermark_audio":
+        # handled earlier
+        pass
+
+    elif stage == "awaiting_media_file":
+        if not (message.audio or message.video or message.document):
+            await message.reply_text("Please send a valid media file.")
+            return
+        await handle_media_file(client, message, conv)
+
+    elif stage == "awaiting_admin_id" and message.text:
+        if message.from_user.id != Config.OWNER_ID:
+            return
+        try:
+            user_id = int(message.text.strip())
+            await add_admin(user_id)
+            await message.reply_text(f"✅ Admin added `{user_id}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_menu")]]))
+            await update_user_conversation(message.chat.id, None)
+        except ValueError:
+            await message.reply_text("Please send a valid user ID (digits only).")
 
 # Admin management callbacks
 @bot.on_callback_query(filters.regex("^admin_menu$") & filters.user(Config.OWNER_ID))
@@ -752,35 +831,6 @@ async def convert_audio_start_cb(client, cb: CallbackQuery):
         "job_dir": job_dir
     })
     await cb.message.edit_text("🎵 **Send File**\n\nSend the file you want to process.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]]))
-
-@bot.on_message(filters.private & (filters.audio | filters.video | filters.document | filters.text) & admin_filter)
-async def message_handler_router(client, message: Message):
-    chat_id = message.chat.id
-    conv = await get_user_conversation(chat_id)
-    if not conv:
-        return
-    stage = conv.get("stage")
-
-    if stage == "awaiting_watermark_audio":
-        # handled earlier
-        pass
-
-    elif stage == "awaiting_media_file":
-        if not (message.audio or message.video or message.document):
-            await message.reply_text("Please send a valid media file.")
-            return
-        await handle_media_file(client, message, conv)
-
-    elif stage == "awaiting_admin_id" and message.text:
-        if message.from_user.id != Config.OWNER_ID:
-            return
-        try:
-            user_id = int(message.text.strip())
-            await add_admin(user_id)
-            await message.reply_text(f"✅ Admin added `{user_id}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_menu")]]))
-            await update_user_conversation(message.chat.id, None)
-        except ValueError:
-            await message.reply_text("Please send a valid user ID (digits only).")
 
 async def handle_media_file(client, message: Message, conv: dict):
     media = message.audio or message.video or message.document
@@ -1365,7 +1415,7 @@ async def root_route_handler(request):
     return web.Response(text="Audio Bot is alive!", content_type='text/html')
 
 async def web_server():
-    web_app = web.Application(client_max_size=30_000_000)
+    web_app = web.Application(client_max_size=300_000_000)
     web_app.add_routes(routes)
     return web_app
 
