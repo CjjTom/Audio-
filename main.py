@@ -1,23 +1,3 @@
-#Audio Converter Bot - main.py (Updated)
-# Uses Pyrogram + aiohttp + Motor (MongoDB) to accept media, probe audio tracks,
-# convert selected track(s) with optional multi-position watermark mixing, and upload result
-#
-# CHANGES MADE:
-# - Improved media detection (documents with audio/video extensions, forwarded files)
-# - Preserve original filename for output (e.g., "The Boys S01E02.mp3")
-# - Progress UI fixes: consistent labels ("Downloading...", "Converting...", "Uploading...") and percent math
-# - New "All (Audio + Video)" output option (uploads audio first, then video; cleanup after both)
-# - Multi-position watermark toggles (Start, Middle, End, Custom) and multi-apply in single FFmpeg pass
-# - "➕ Send Audio/Video" quick-start button on /start
-# - Admin-specific watermark storage expanded (file_id, volume, positions)
-# - Automatic start of conversion when user sends a media file even if no prior session
-# - Various small bug fixes and safer error handling
-#
-# NOTE: This file is intended to replace the original main.py completely (full file provided).
-# Ensure necessary environment variables are set (API_ID, API_HASH, BOT_TOKEN, OWNER_ID, MONGO_URI, PORT).
-#
-# Keep audio-quality focused presets — no ultrafast/low-quality shortcuts were introduced.
-
 import os
 import re
 import math
@@ -114,6 +94,7 @@ if not os.path.isdir(Config.DOWNLOAD_DIR):
 ffmpeg_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_JOBS)
 DOWNLOAD_PROGRESS = {}
 JOB_TRACKERS = {}  # job_id -> dict: {cancelled:bool, last_update_time:float, bytes_processed:int,...}
+CANCEL_DOWNLOADS = set()  # chat_id set for downloads user requested to cancel
 
 # -------------------------------------------------------------------------------- #
 # DATABASE
@@ -344,6 +325,7 @@ async def safe_edit(message, text, reply_markup=None):
 
 # -------------------------------------------------------------------------------- #
 # Run ffmpeg with progress parsing + cancel support (improved)
+# (REPLACED: improved percent computation and final 100% after actual exit)
 # -------------------------------------------------------------------------------- #
 
 async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg, job_id, update_every=Config.PROGRESS_UPDATE_INTERVAL):
@@ -404,35 +386,34 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
                         total_size = int(v)
                     except:
                         total_size = 0
-                elif k == "progress" and v == "end":
-                    # set percent to 100% for finalization stage (will be set after process completes)
-                    percent = 100.0
+                elif k == "progress":
+                    # do not force 100% when ffmpeg says 'end'.
+                    # Instead treat it as "finalizing" — we may show 99.9% and wait for process to exit.
+                    if v == "end":
+                        # nudge percent towards completion but not 100% yet
+                        percent = max(percent, 99.9)
 
             # compute percent using time if possible (preferred)
             if total_duration_seconds and out_time_ms:
                 processed_seconds = out_time_ms / 1000.0
                 percent = min(100.0, (processed_seconds / total_duration_seconds) * 100.0)
             else:
-                # fallback: if total_size available, approximate using total_size / last known
-                if total_size and JOB_TRACKERS[job_id].get("last_size"):
-                    try:
-                        last_known = JOB_TRACKERS[job_id]["last_size"]
-                        percent = min(100.0, (total_size / (last_known if last_known else total_size)) * 100.0)
-                    except:
-                        percent = JOB_TRACKERS[job_id].get("last_percent", 0.0)
+                # if we don't know total duration, keep percent unchanged or capped by previous value
+                percent = JOB_TRACKERS[job_id].get("last_percent", percent)
 
             now = time.time()
             if now - JOB_TRACKERS[job_id]["last_update"] > update_every:
-                # compute speed roughly from bytes if possible
+                # compute speed roughly from out_time_ms progression if possible or from size/time if available
                 elapsed = now - JOB_TRACKERS[job_id]["start_ts"]
                 size_for_speed = total_size if total_size else JOB_TRACKERS[job_id].get("bytes_processed", 0)
                 speed = (size_for_speed / elapsed) if elapsed > 0 else 0.0
                 bar = progress_bar(percent, length=20)
                 eta_seconds = None
-                if speed > 0 and total_size:
+                if speed > 0 and total_size and size_for_speed < total_size:
                     remaining = max(0, total_size - size_for_speed)
                     eta_seconds = remaining / speed
                 elif speed > 0 and total_duration_seconds and percent > 0:
+                    # estimate remaining time from percent
                     eta_seconds = (total_duration_seconds * (100.0 - percent) / percent)
 
                 eta_str = format_time(eta_seconds) if eta_seconds is not None else "--:--:--"
@@ -451,7 +432,6 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
 
     except asyncio.CancelledError as ce:
         LOGGER.info(f"ffmpeg cancelled for job {job_id}: {ce}")
-        # cleanup process
         try:
             if process and process.returncode is None:
                 process.terminate()
@@ -478,7 +458,19 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
         except Exception:
             rc = None
 
-    if rc and rc != 0:
+    if rc == 0:
+        try:
+            final_txt = (
+                f"**Converting Progress:** {progress_bar(100.0, length=20)}\n\n"
+                f"📊 **Percentage:** 100.00%\n\n"
+                f"⏳ **Elapsed:** {format_time(time.time() - JOB_TRACKERS[job_id]['start_ts'])}\n\n"
+                f"🚀 **Speed:** {human_size(0)}/s\n\n"
+                f"⏳ **ETA:** 00:00:00"
+            )
+            await safe_edit(status_msg, final_txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancel", callback_data=f"cancel_job|{job_id}")]]))
+        except Exception:
+            pass
+    elif rc and rc != 0:
         try:
             stderr_data = await process.stderr.read()
             err_text = stderr_data.decode('utf-8', errors='ignore')[:4000]
@@ -498,8 +490,18 @@ bot = Client("AudioBot", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_tok
 
 # progress callback for download/upload (and generic updates)
 async def progress_callback(current, total, message, action):
-    global DOWNLOAD_PROGRESS
+    global DOWNLOAD_PROGRESS, CANCEL_DOWNLOADS
     try:
+        # If user requested cancellation for this chat, raise to abort download/upload
+        chat_id = getattr(message, "chat", None).id if getattr(message, "chat", None) else None
+        if chat_id in CANCEL_DOWNLOADS:
+            # clear the cancellation marker for this chat so future ops aren't affected
+            try:
+                CANCEL_DOWNLOADS.remove(chat_id)
+            except KeyError:
+                pass
+            raise Exception("Download cancelled by user.")
+
         percent = (current / total) * 100 if total else 0.0
     except:
         percent = 0.0
@@ -529,8 +531,10 @@ async def progress_callback(current, total, message, action):
             f"🚀 **Speed:** {human_size(int(speed))}/s\n\n"
             f"⏳ **ETA:** {eta_str}"
         )
+        # Add a cancel button for downloads/uploads
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_download_process")]])
         try:
-            await message.edit_text(txt)
+            await message.edit_text(txt, reply_markup=cancel_kb)
             DOWNLOAD_PROGRESS[msg_id] = {"ts": now, "bytes": current}
         except (MessageNotModified, FloodWait):
             pass
@@ -687,7 +691,7 @@ async def owner_wm_vol_save(client, cb: CallbackQuery):
     await cb.answer(f"Volume set to {int(vol*100)}%.")
     await watermark_settings_cb(client, cb)
 
-# Owner positions toggle UI
+# Owner positions toggle UI (REPLACED: with Select All/Deselect All)
 @bot.on_callback_query(filters.regex("^owner_wm_positions$") & filters.user(Config.OWNER_ID))
 async def owner_wm_positions_cb(client, cb: CallbackQuery):
     await cb.answer()
@@ -697,26 +701,28 @@ async def owner_wm_positions_cb(client, cb: CallbackQuery):
     def mk_btn(name):
         mark = "✅" if name in current else "❌"
         return InlineKeyboardButton(f"{mark} {name.capitalize()}", callback_data=f"owner_togglepos_{name}")
+    # Select All / Deselect All toggle
+    sel_all_label = "Select All" if set(["start","middle","end"]).difference(current) else "Deselect All"
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(sel_all_label, callback_data="owner_positions_select_all")],
         [mk_btn("start"), mk_btn("middle")],
         [mk_btn("end"), InlineKeyboardButton("Custom", callback_data="owner_pos_custom_prompt")],
         [InlineKeyboardButton("➡️ Done", callback_data="owner_pos_done"), InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]
     ])
     await cb.message.edit_text("📍 Toggle positions to apply owner watermark at multiple timestamps:", reply_markup=kb)
 
-@bot.on_callback_query(filters.regex(r"^owner_togglepos_(start|middle|end)$") & filters.user(Config.OWNER_ID))
-async def owner_togglepos_cb(client, cb: CallbackQuery):
+@bot.on_callback_query(filters.regex("^owner_positions_select_all$") & filters.user(Config.OWNER_ID))
+async def owner_positions_select_all_cb(client, cb: CallbackQuery):
     await cb.answer()
-    pos = cb.data.split("_")[-1]
     owner_wm = await get_owner_watermark()
-    positions = set(owner_wm.get("positions", ["start","end"]))
-    if pos in positions:
-        positions.remove(pos)
+    current = set(owner_wm.get("positions", ["start","end"]))
+    all_set = set(["start","middle","end"])
+    # if not all selected -> select all; otherwise deselect all (keep at least start)
+    if not all_set.issubset(current):
+        new = list(all_set)
     else:
-        positions.add(pos)
-    if not positions:
-        positions = set(["start"])
-    await set_owner_watermark_positions(list(positions))
+        new = ["start"]
+    await set_owner_watermark_positions(new, owner_wm.get("custom_seconds", 0))
     await owner_wm_positions_cb(client, cb)
 
 @bot.on_callback_query(filters.regex("^owner_pos_custom_prompt$") & filters.user(Config.OWNER_ID))
@@ -730,7 +736,7 @@ async def owner_pos_done_cb(client, cb: CallbackQuery):
     await cb.answer()
     await watermark_settings_cb(client, cb)
 
-# Admin positions toggle UI
+# Admin positions toggle UI (REPLACED: with Select All/Deselect All)
 @bot.on_callback_query(filters.regex("^admin_wm_positions$") & admin_filter)
 async def admin_wm_positions_cb(client, cb: CallbackQuery):
     await cb.answer()
@@ -739,26 +745,26 @@ async def admin_wm_positions_cb(client, cb: CallbackQuery):
     def mk_btn(name):
         mark = "✅" if name in current else "❌"
         return InlineKeyboardButton(f"{mark} {name.capitalize()}", callback_data=f"admin_togglepos_{name}")
+    sel_all_label = "Select All" if set(["start","middle","end"]).difference(current) else "Deselect All"
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(sel_all_label, callback_data="admin_positions_select_all")],
         [mk_btn("start"), mk_btn("middle")],
         [mk_btn("end"), InlineKeyboardButton("Custom", callback_data="admin_pos_custom_prompt")],
         [InlineKeyboardButton("➡️ Done", callback_data="admin_pos_done"), InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]
     ])
     await cb.message.edit_text("📍 Toggle positions to apply your watermark at multiple timestamps:", reply_markup=kb)
 
-@bot.on_callback_query(filters.regex(r"^admin_togglepos_(start|middle|end)$") & admin_filter)
-async def admin_togglepos_cb(client, cb: CallbackQuery):
+@bot.on_callback_query(filters.regex("^admin_positions_select_all$") & admin_filter)
+async def admin_positions_select_all_cb(client, cb: CallbackQuery):
     await cb.answer()
-    pos = cb.data.split("_")[-1]
     admin_wm = await get_admin_watermark(cb.from_user.id) or {"positions":["start","end"], "custom_seconds":0}
-    positions = set(admin_wm.get("positions", ["start","end"]))
-    if pos in positions:
-        positions.remove(pos)
+    current = set(admin_wm.get("positions", ["start","end"]))
+    all_set = set(["start","middle","end"])
+    if not all_set.issubset(current):
+        new = list(all_set)
     else:
-        positions.add(pos)
-    if not positions:
-        positions = set(["start"])
-    await update_admin_watermark_positions(cb.from_user.id, list(positions))
+        new = ["start"]
+    await update_admin_watermark_positions(cb.from_user.id, new, admin_wm.get("custom_seconds", 0))
     await admin_wm_positions_cb(client, cb)
 
 @bot.on_callback_query(filters.regex("^admin_pos_custom_prompt$") & admin_filter)
@@ -1056,10 +1062,14 @@ async def handle_media_file(client, message: Message, conv: dict):
         if downloaded:
             input_file_path = downloaded
     except Exception as e:
-        LOGGER.error(f"File download failed: {e}", exc_info=True)
+        LOGGER.error(f"File download failed or cancelled: {e}", exc_info=True)
         try:
-            await status_msg.edit_text(f"❌ **Download Failed**\n\n`{e}`")
-        except:
+            # If it was canceled by user, show friendly message
+            if str(e) == "Download cancelled by user.":
+                await status_msg.edit_text("❌ **Download Cancelled by User.**")
+            else:
+                await status_msg.edit_text(f"❌ **Download Failed**\n\n`{e}`")
+        except Exception:
             pass
         asyncio.create_task(clear_conversation_after_delay(message.chat.id))
         return
@@ -1221,6 +1231,7 @@ async def watermark_selection_cb(client, cb: CallbackQuery):
         await update_user_conversation(chat_id, {"wm_positions": owner_wm.get("positions", ["start","end"]), "wm_custom_seconds": owner_wm.get("custom_seconds", 0)})
         # present toggle UI
         await cb.message.edit_text("Owner watermark selected.\n\nToggle positions (you can select multiple):", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Select All", callback_data="wm_toggle_select_all")],
             [InlineKeyboardButton("Start", callback_data="wm_toggle_start"), InlineKeyboardButton("Middle", callback_data="wm_toggle_middle")],
             [InlineKeyboardButton("End", callback_data="wm_toggle_end"), InlineKeyboardButton("Custom", callback_data="wm_pos_custom_prompt")],
             [InlineKeyboardButton("➡️ Continue", callback_data="wm_pos_done")]
@@ -1234,6 +1245,7 @@ async def watermark_selection_cb(client, cb: CallbackQuery):
         await update_user_conversation(chat_id, {"watermark": True, "watermark_choice": "admin"})
         await update_user_conversation(chat_id, {"wm_positions": admin_wm.get("positions", ["start","end"]), "wm_custom_seconds": admin_wm.get("custom_seconds", 0)})
         await cb.message.edit_text("Your watermark selected. Toggle positions (you can select multiple):", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Select All", callback_data="wm_toggle_select_all")],
             [InlineKeyboardButton("Start", callback_data="wm_toggle_start"), InlineKeyboardButton("Middle", callback_data="wm_toggle_middle")],
             [InlineKeyboardButton("End", callback_data="wm_toggle_end"), InlineKeyboardButton("Custom", callback_data="wm_pos_custom_prompt")],
             [InlineKeyboardButton("➡️ Continue", callback_data="wm_pos_done")]
@@ -1262,11 +1274,30 @@ async def wm_toggle_generic_cb(client, cb: CallbackQuery):
     await update_user_conversation(chat_id, {"wm_positions": list(current)})
     # reflect selections in UI by adding marks to text (simple re-render)
     selected = ", ".join(sorted(list(current)))
+    sel_all_label = "Select All" if set(["start","middle","end"]).difference(current) else "Deselect All"
     await cb.message.edit_text(f"Selected positions: `{selected}`\n\nToggle more or press Continue.", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton(sel_all_label, callback_data="wm_toggle_select_all")],
         [InlineKeyboardButton("Start", callback_data="wm_toggle_start"), InlineKeyboardButton("Middle", callback_data="wm_toggle_middle")],
         [InlineKeyboardButton("End", callback_data="wm_toggle_end"), InlineKeyboardButton("Custom", callback_data="wm_pos_custom_prompt")],
         [InlineKeyboardButton("➡️ Continue", callback_data="wm_pos_done")]
     ]))
+
+@bot.on_callback_query(filters.regex(r"^wm_toggle_select_all$") & admin_filter)
+async def wm_toggle_select_all_cb(client, cb: CallbackQuery):
+    await cb.answer()
+    chat_id = cb.message.chat.id
+    conv = await get_user_conversation(chat_id)
+    if not conv:
+        return await cb.answer("Session expired.", show_alert=True)
+    current = set(conv.get("wm_positions", []))
+    all_set = set(["start","middle","end"])
+    if not all_set.issubset(current):
+        new = list(all_set)
+    else:
+        new = ["start"]
+    await update_user_conversation(chat_id, {"wm_positions": new})
+    # re-render
+    await wm_toggle_generic_cb(client, cb)
 
 @bot.on_callback_query(filters.regex("^wm_pos_custom_prompt$") & admin_filter)
 async def wm_pos_custom_prompt(client, cb: CallbackQuery):
@@ -1331,6 +1362,7 @@ async def output_selection_cb(client, cb: CallbackQuery):
 
 # -------------------------------------------------------------------------------- #
 # FFmpeg args builder with multi-position watermark positioning
+# (MODIFIED: Start at +3min, End at -7min logic + safe clamping)
 # -------------------------------------------------------------------------------- #
 
 async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_format=None, override_output_type=None):
@@ -1338,6 +1370,12 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_for
     Build FFmpeg args based on conversation. Supports multi-position watermarks list:
     conv['wm_positions'] -> list like ['start','middle','end','custom']
     custom seconds in conv['wm_custom_seconds'] if 'custom' selected
+
+    Additional logic:
+    - 'start' position maps to 180s (3 minutes) into the video if the video is longer than 180s,
+      otherwise 0s.
+    - 'end' position maps to duration - 420s (7 minutes before end). If that's negative or too
+      close to the end (or would cause watermark to overflow), we clamp safely.
     """
     track_index = conv["selected_track_index"]
     stream_obj = conv["selected_stream_obj"]
@@ -1405,15 +1443,27 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_for
         except:
             wm_dur = 0.0
 
-        # compute position timestamps in seconds for each selected position (start=0, middle center, end align)
+        # compute position timestamps in seconds for each selected position (start=180s default, middle center, end = duration-420s)
         positions = []
         for p in wm_positions:
             if p == "start":
-                positions.append(0.0)
+                # start at 180s (3 minutes) if video longer; else 0
+                desired = 180.0 if input_duration > 180.0 else 0.0
+                # ensure watermark doesn't overflow end
+                desired = min(desired, max(0.0, input_duration - wm_dur))
+                positions.append(desired)
             elif p == "middle":
                 positions.append(max(0.0, (input_duration / 2.0) - (wm_dur / 2.0)))
             elif p == "end":
-                positions.append(max(0.0, input_duration - wm_dur))
+                # target 7 minutes (420s) before video ends
+                desired = input_duration - 420.0
+                if desired < 0:
+                    # video shorter than 7 minutes: place watermark so it fits before end
+                    desired = max(0.0, input_duration - wm_dur)
+                else:
+                    # ensure watermark fits
+                    desired = min(desired, max(0.0, input_duration - wm_dur))
+                positions.append(desired)
             elif p == "custom":
                 positions.append(max(0.0, float(wm_custom_seconds)))
         # deduplicate and sort ascending
@@ -1532,7 +1582,7 @@ async def start_conversion_process(cb: CallbackQuery):
                     wm_file_id = owner_wm.get("file_id")
                     wm_vol = owner_wm.get("volume", 0.2)
                     wm_pos = conv.get("wm_positions") or owner_wm.get("positions", ["start","end"])
-                    wm_custom = conv.get("wm_custom_seconds") or owner_wm.get("custom_seconds", 0)
+                    wm_custom = conv.get("wm_custom_seconds") or owner_wm.get("custom_seconds") or 0
                     wm_max_within = owner_wm.get("max_within_seconds", 3600)
                     wm_info.update({"which": "owner", "volume": wm_vol, "positions": wm_pos, "custom": wm_custom, "max_within_seconds": wm_max_within})
                 else:
@@ -1691,6 +1741,21 @@ async def cancel_job_cb(client, cb: CallbackQuery):
     await cb.message.edit_text("⛔ You cancelled the job. Please wait a moment; system is cleaning up...")
 
 # -------------------------------------------------------------------------------- #
+# Cancel download handler (new)
+# -------------------------------------------------------------------------------- #
+
+@bot.on_callback_query(filters.regex("^cancel_download_process$") & admin_filter)
+async def cancel_download_process_cb(client, cb: CallbackQuery):
+    await cb.answer("Stopping download...", show_alert=True)
+    chat_id = cb.message.chat.id
+    # Mark this chat for cancellation; progress_callback will raise and download will abort
+    CANCEL_DOWNLOADS.add(chat_id)
+    try:
+        await cb.message.edit_text("❌ **Download cancel requested. Stopping...**")
+    except Exception:
+        pass
+
+# -------------------------------------------------------------------------------- #
 # Web server & ping
 # -------------------------------------------------------------------------------- #
 
@@ -1738,7 +1803,7 @@ if __name__ == "__main__":
         await site.start()
         LOGGER.info(f"Web server started on port {Config.PORT}.")
         try:
-            await bot.send_message(Config.OWNER_ID, "**✅ Audio Bot restarted — all services online!**")
+            await bot.send_message(Config.OWNER_ID, "**✅ 1.9 Audio Bot restarted — all services online!**")
         except Exception as e:
             LOGGER.warning(f"Could not send startup message: {e}")
         await asyncio.Event().wait()
