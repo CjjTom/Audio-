@@ -1,6 +1,22 @@
-#Audio Converter Bot - main.py (English Version)
+#Audio Converter Bot - main.py (Updated)
 # Uses Pyrogram + aiohttp + Motor (MongoDB) to accept media, probe audio tracks,
-# convert selected track(s) with optional watermark mixing, and upload result#
+# convert selected track(s) with optional multi-position watermark mixing, and upload result
+#
+# CHANGES MADE:
+# - Improved media detection (documents with audio/video extensions, forwarded files)
+# - Preserve original filename for output (e.g., "The Boys S01E02.mp3")
+# - Progress UI fixes: consistent labels ("Downloading...", "Converting...", "Uploading...") and percent math
+# - New "All (Audio + Video)" output option (uploads audio first, then video; cleanup after both)
+# - Multi-position watermark toggles (Start, Middle, End, Custom) and multi-apply in single FFmpeg pass
+# - "➕ Send Audio/Video" quick-start button on /start
+# - Admin-specific watermark storage expanded (file_id, volume, positions)
+# - Automatic start of conversion when user sends a media file even if no prior session
+# - Various small bug fixes and safer error handling
+#
+# NOTE: This file is intended to replace the original main.py completely (full file provided).
+# Ensure necessary environment variables are set (API_ID, API_HASH, BOT_TOKEN, OWNER_ID, MONGO_URI, PORT).
+#
+# Keep audio-quality focused presets — no ultrafast/low-quality shortcuts were introduced.
 
 import os
 import re
@@ -128,18 +144,18 @@ async def clear_conversation_after_delay(chat_id, delay=Config.CONVERSATION_CLEA
     LOGGER.info(f"Auto-cleared conversation state for chat_id: {chat_id}")
 
 # -------------------------------------------------------------------------------- #
-# Watermark storage: owner + per-admin
+# Watermark storage: owner + per-admin (expanded to store positions list + volume)
 # -------------------------------------------------------------------------------- #
 
 async def get_owner_watermark():
     doc = await bot_settings_collection.find_one({"_id": "owner_watermark"})
     if not doc:
-        # default: no file, default volume 0.2 and default position start+end within first hour
-        return {"file_id": None, "volume": 0.2, "position_mode": "start_end", "custom_seconds": 0, "max_within_seconds": 3600}
+        # default: no file, default volume 0.2 and default positions start+end within first hour
+        return {"file_id": None, "volume": 0.2, "positions": ["start","end"], "custom_seconds": 0, "max_within_seconds": 3600}
     return {
         "file_id": doc.get("file_id"),
         "volume": float(doc.get("volume", 0.2)),
-        "position_mode": doc.get("position_mode", "start_end"),
+        "positions": doc.get("positions", ["start","end"]),
         "custom_seconds": int(doc.get("custom_seconds", 0)),
         "max_within_seconds": int(doc.get("max_within_seconds", 3600))
     }
@@ -150,25 +166,30 @@ async def set_owner_watermark_file(file_id):
 async def set_owner_watermark_volume(volume: float):
     await bot_settings_collection.update_one({"_id": "owner_watermark"}, {"$set": {"volume": float(volume)}}, upsert=True)
 
-async def set_owner_watermark_position(mode: str, custom_seconds: int = 0):
+async def set_owner_watermark_positions(positions: list, custom_seconds: int = 0):
     await bot_settings_collection.update_one(
         {"_id": "owner_watermark"},
-        {"$set": {"position_mode": mode, "custom_seconds": int(custom_seconds)}},
+        {"$set": {"positions": positions, "custom_seconds": int(custom_seconds)}},
         upsert=True
     )
 
 async def delete_owner_watermark():
     await bot_settings_collection.update_one({"_id": "owner_watermark"}, {"$unset": {"file_id": ""}})
 
-# Per-admin watermark
-async def set_admin_watermark(user_id: int, file_id: str, volume: float=0.2, position_mode:str="start_end", custom_seconds:int=0):
+# Per-admin watermark (supports storing positions list, volume)
+async def set_admin_watermark(user_id: int, file_id: str, volume: float=0.2, positions:list=None, custom_seconds:int=0):
+    if positions is None:
+        positions = ["start","end"]
     await admin_collection.update_one(
         {"_id": user_id},
         {"$set": {
-            "watermark": {"file_id": file_id, "volume": float(volume), "position_mode": position_mode, "custom_seconds": int(custom_seconds)}
+            "watermark": {"file_id": file_id, "volume": float(volume), "positions": positions, "custom_seconds": int(custom_seconds), "date_added": datetime.utcnow()}
         }},
         upsert=True
     )
+
+async def update_admin_watermark_positions(user_id:int, positions:list, custom_seconds:int=0):
+    await admin_collection.update_one({"_id": user_id}, {"$set": {"watermark.positions": positions, "watermark.custom_seconds": int(custom_seconds)}}, upsert=False)
 
 async def get_admin_watermark(user_id: int):
     doc = await admin_collection.find_one({"_id": user_id})
@@ -238,7 +259,7 @@ async def admin_filter_func(_, __, message_or_query):
 admin_filter = filters.create(admin_filter_func)
 
 # -------------------------------------------------------------------------------- #
-# Utilities: shell, ffprobe, duration
+# Utilities: shell, ffprobe, duration, ext helpers
 # -------------------------------------------------------------------------------- #
 
 async def run_shell_command(command):
@@ -271,8 +292,22 @@ async def get_media_duration(file_path):
         LOGGER.warning(f"Failed to get duration for {file_path}: {e}")
         return 0.0
 
+def safe_ext_from_filename(filename: str) -> str:
+    if not filename:
+        return ""
+    _, ext = os.path.splitext(filename)
+    return ext.lower().lstrip('.')  # returns 'm4a', 'mp3', 'mkv', etc.
+
+def sanitize_filename(fn: str) -> str:
+    # Keep it simple: remove problematic chars
+    if not fn:
+        return f"file_{uuid.uuid4()}"
+    fn = str(fn)
+    fn = re.sub(r'[/\\<>:"|?*\x00-\x1F]', '_', fn)
+    return fn
+
 # -------------------------------------------------------------------------------- #
-# Progress UI Helpers
+# Progress UI Helpers (fixed math, consistent labels)
 # -------------------------------------------------------------------------------- #
 
 def human_size(num_bytes: int) -> str:
@@ -287,6 +322,8 @@ def human_size(num_bytes: int) -> str:
     return f"{num_bytes:.2f} PB"
 
 def progress_bar(percent: float, length: int = 20) -> str:
+    # percent [0..100]
+    percent = max(0.0, min(100.0, percent))
     filled = int(math.floor((percent / 100.0) * length))
     bar = "█" * filled + "░" * (length - filled)
     return f"[{bar}]"
@@ -306,17 +343,16 @@ async def safe_edit(message, text, reply_markup=None):
         LOGGER.warning(f"Failed to edit message: {e}")
 
 # -------------------------------------------------------------------------------- #
-# Run ffmpeg with progress parsing + cancel support
+# Run ffmpeg with progress parsing + cancel support (improved)
 # -------------------------------------------------------------------------------- #
 
 async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg, job_id, update_every=Config.PROGRESS_UPDATE_INTERVAL):
     """
-    Runs ffmpeg with -progress pipe:1, parses out_time_ms, total_size where available,
-    and updates the status_msg with the requested progress block. Uses JOB_TRACKERS[job_id]
-    to support cancellation.
+    Runs ffmpeg with -progress pipe:1, parses out_time_ms, updates the status_msg with progress.
+    Uses JOB_TRACKERS[job_id] to support cancellation.
     """
     # Ensure tracker entry
-    JOB_TRACKERS.setdefault(job_id, {"cancelled": False, "last_update": 0.0, "bytes_processed": 0, "start_ts": time.time(), "last_bytes": 0})
+    JOB_TRACKERS.setdefault(job_id, {"cancelled": False, "last_update": 0.0, "bytes_processed": 0, "start_ts": time.time(), "last_time": time.time(), "last_percent": 0.0})
 
     if "-progress" not in args_list:
         args_list.extend(["-progress", "pipe:1", "-nostats"])
@@ -328,17 +364,13 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
         stderr=asyncio.subprocess.PIPE
     )
 
-    last_update = 0.0
     out_time_ms = 0
     total_size = 0
-    bytes_written = 0
-    last_bytes = 0
-    last_time = time.time()
+    percent = 0.0
 
     # prepare cancel button
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancel", callback_data=f"cancel_job|{job_id}")]])
 
-    # read stdout lines (ffmpeg -progress)
     try:
         while True:
             # Check cancellation frequently
@@ -373,69 +405,49 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
                     except:
                         total_size = 0
                 elif k == "progress" and v == "end":
-                    # set percent to 99.9% for finalization stage
-                    percent = 99.9
-                    now = time.time()
-                    if now - JOB_TRACKERS[job_id]["last_update"] > update_every:
-                        # compute speed from bytes delta
-                        now_time = time.time()
-                        dt = now_time - JOB_TRACKERS[job_id].get("last_time", JOB_TRACKERS[job_id]["start_ts"])
-                        dbytes = total_size - JOB_TRACKERS[job_id].get("last_bytes", 0)
-                        speed = dbytes / dt if dt > 0 else 0.0
-                        bar = progress_bar(percent, length=20)
-                        txt = (
-                            f"**Converting Progress:** {bar}\n\n"
-                            f"📊 **Percentage:** {percent:.2f}%\n\n"
-                            f"✅ **Processed:** {human_size(total_size)}\n\n"
-                            f"🚀 **Speed:** {human_size(int(speed))}/s\n\n"
-                            f"⏳ **ETA:** --:--:--"
-                        )
-                        await safe_edit(status_msg, txt, reply_markup=cancel_kb)
-                        JOB_TRACKERS[job_id]["last_update"] = now
-                        JOB_TRACKERS[job_id]["last_time"] = now_time
-                        JOB_TRACKERS[job_id]["last_bytes"] = total_size
-                # else continue; we will compute percent from out_time_ms
+                    # set percent to 100% for finalization stage (will be set after process completes)
+                    percent = 100.0
 
-            # compute percent and display at intervals
-            percent = 0.0
+            # compute percent using time if possible (preferred)
             if total_duration_seconds and out_time_ms:
                 processed_seconds = out_time_ms / 1000.0
                 percent = min(100.0, (processed_seconds / total_duration_seconds) * 100.0)
+            else:
+                # fallback: if total_size available, approximate using total_size / last known
+                if total_size and JOB_TRACKERS[job_id].get("last_size"):
+                    try:
+                        last_known = JOB_TRACKERS[job_id]["last_size"]
+                        percent = min(100.0, (total_size / (last_known if last_known else total_size)) * 100.0)
+                    except:
+                        percent = JOB_TRACKERS[job_id].get("last_percent", 0.0)
 
             now = time.time()
             if now - JOB_TRACKERS[job_id]["last_update"] > update_every:
-                # compute speed approximately using total_size / elapsed
+                # compute speed roughly from bytes if possible
                 elapsed = now - JOB_TRACKERS[job_id]["start_ts"]
                 size_for_speed = total_size if total_size else JOB_TRACKERS[job_id].get("bytes_processed", 0)
                 speed = (size_for_speed / elapsed) if elapsed > 0 else 0.0
-                # approximate downloaded/converted bytes shown
-                converted_bytes = total_size if total_size else JOB_TRACKERS[job_id].get("bytes_processed", 0)
                 bar = progress_bar(percent, length=20)
-                # ETA compute
                 eta_seconds = None
                 if speed > 0 and total_size:
-                    remaining = max(0, total_size - converted_bytes)
+                    remaining = max(0, total_size - size_for_speed)
                     eta_seconds = remaining / speed
-                elif speed > 0 and total_duration_seconds:
-                    # estimate size from percent
-                    if percent > 0:
-                        eta_seconds = (total_duration_seconds * (100.0 - percent) / percent)
-                else:
-                    eta_seconds = None
+                elif speed > 0 and total_duration_seconds and percent > 0:
+                    eta_seconds = (total_duration_seconds * (100.0 - percent) / percent)
 
                 eta_str = format_time(eta_seconds) if eta_seconds is not None else "--:--:--"
 
                 txt = (
-                    f"**Download Progress:** {bar}\n\n"
+                    f"**Converting Progress:** {bar}\n\n"
                     f"📊 **Percentage:** {percent:.2f}%\n\n"
-                    f"✅ **Downloaded:** {human_size(int(converted_bytes))} / {human_size(int(total_size) if total_size else 0)}\n\n"
+                    f"⏳ **Elapsed:** {format_time(now - JOB_TRACKERS[job_id]['start_ts'])}\n\n"
                     f"🚀 **Speed:** {human_size(int(speed))}/s\n\n"
                     f"⏳ **ETA:** {eta_str}"
                 )
                 await safe_edit(status_msg, txt, reply_markup=cancel_kb)
                 JOB_TRACKERS[job_id]["last_update"] = now
-                JOB_TRACKERS[job_id]["last_bytes"] = converted_bytes
-                JOB_TRACKERS[job_id]["last_time"] = now
+                JOB_TRACKERS[job_id]["last_size"] = total_size
+                JOB_TRACKERS[job_id]["last_percent"] = percent
 
     except asyncio.CancelledError as ce:
         LOGGER.info(f"ffmpeg cancelled for job {job_id}: {ce}")
@@ -448,8 +460,11 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
         raise
     except Exception as e:
         # read remaining stderr
-        stderr_acc = await process.stderr.read()
-        err_text = stderr_acc.decode('utf-8', errors='ignore')[:4000]
+        try:
+            stderr_acc = await process.stderr.read()
+            err_text = stderr_acc.decode('utf-8', errors='ignore')[:4000]
+        except Exception:
+            err_text = ""
         LOGGER.error(f"FFMPEG runtime error: {e}\nStderr: {err_text}")
         try:
             process.terminate()
@@ -464,8 +479,11 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
             rc = None
 
     if rc and rc != 0:
-        stderr_data = await process.stderr.read()
-        err_text = stderr_data.decode('utf-8', errors='ignore')[:4000]
+        try:
+            stderr_data = await process.stderr.read()
+            err_text = stderr_data.decode('utf-8', errors='ignore')[:4000]
+        except:
+            err_text = ""
         LOGGER.error(f"FFMPEG failed (rc={rc}): {err_text}")
         raise RuntimeError(f"FFMPEG failed. {err_text}")
 
@@ -478,7 +496,7 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
 
 bot = Client("AudioBot", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_token=Config.BOT_TOKEN)
 
-# progress callback for download/upload
+# progress callback for download/upload (and generic updates)
 async def progress_callback(current, total, message, action):
     global DOWNLOAD_PROGRESS
     try:
@@ -487,26 +505,27 @@ async def progress_callback(current, total, message, action):
         percent = 0.0
     now = time.time()
     msg_id = getattr(message, "id", None) or 0
-    last = DOWNLOAD_PROGRESS.get(msg_id, {"ts": 0})
-    if now - last.get("ts", 0) > 3:
+    last = DOWNLOAD_PROGRESS.get(msg_id, {"ts": 0, "bytes": 0})
+    if now - last.get("ts", 0) > 2:
         # build progress block similar to conversion
         bar = progress_bar(percent, length=20)
-        speed = 0.0
-        # naive speed: if we have previous
         prev_bytes = last.get("bytes", 0)
         prev_time = last.get("ts", now)
         dt = now - prev_time if now - prev_time > 0 else 1.0
-        dbytes = current - prev_bytes
+        dbytes = max(0, current - prev_bytes)
         speed = dbytes / dt if dt > 0 else 0.0
         eta = None
-        if speed > 0:
+        if speed > 0 and total and total > current:
             eta = (total - current) / speed
         eta_str = format_time(eta) if eta is not None else "--:--:--"
 
+        header = "Downloading"
+        if isinstance(action, str):
+            header = action
         txt = (
-            f"**Download Progress:** {bar}\n\n"
+            f"**{header}** {bar}\n\n"
             f"📊 **Percentage:** {percent:.2f}%\n\n"
-            f"✅ **Downloaded:** {human_size(int(current))} / {human_size(int(total))}\n\n"
+            f"✅ **Processed:** {human_size(int(current))} / {human_size(int(total))}\n\n"
             f"🚀 **Speed:** {human_size(int(speed))}/s\n\n"
             f"⏳ **ETA:** {eta_str}"
         )
@@ -525,13 +544,14 @@ async def progress_callback(current, total, message, action):
 @bot.on_message(filters.command("start") & filters.private & admin_filter)
 async def start_command(client, message):
     buttons = [
-        [InlineKeyboardButton("🎧 Audio Tools", callback_data="audio_tools_menu")]
+        [InlineKeyboardButton("🎧 Audio Tools", callback_data="audio_tools_menu")],
+        [InlineKeyboardButton("➕ Send Audio/Video", callback_data="quick_send")]
     ]
     if message.from_user.id == Config.OWNER_ID:
         buttons.append([InlineKeyboardButton("👨‍💼 Admin Management", callback_data="admin_menu")])
     await message.reply_text(
         "**🎧 Audio Converter Bot**\n\n"
-        "This bot accepts audio files, converts them with optional watermark mixing, and returns the processed file.",
+        "This bot accepts audio/video files, converts them with optional watermark mixing, and returns the processed file.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
     await update_user_conversation(message.chat.id, None)
@@ -540,7 +560,8 @@ async def start_command(client, message):
 async def main_menu_cb(client, cb: CallbackQuery):
     await cb.answer()
     buttons = [
-        [InlineKeyboardButton("🎧 Audio Tools", callback_data="audio_tools_menu")]
+        [InlineKeyboardButton("🎧 Audio Tools", callback_data="audio_tools_menu")],
+        [InlineKeyboardButton("➕ Send Audio/Video", callback_data="quick_send")]
     ]
     if cb.from_user.id == Config.OWNER_ID:
         buttons.append([InlineKeyboardButton("👨‍💼 Admin Management", callback_data="admin_menu")])
@@ -560,11 +581,27 @@ async def audio_tools_menu_cb(client, cb: CallbackQuery):
     await cb.message.edit_text(
         "**🎧 Audio Tools**\n\nChoose an option:",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎵 Convert Audio", callback_data="convert_audio_start")],
+            [InlineKeyboardButton("🎵 Convert Audio/Video", callback_data="convert_audio_start")],
             [InlineKeyboardButton("⚙️ Watermark Settings", callback_data="watermark_settings")],
             [InlineKeyboardButton("⬅️ Back to Main", callback_data="main_menu")]
         ])
     )
+
+@bot.on_callback_query(filters.regex("^quick_send$") & admin_filter)
+async def quick_send_cb(client, cb: CallbackQuery):
+    await cb.answer()
+    job_id = str(uuid.uuid4())
+    job_dir = os.path.join(Config.DOWNLOAD_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    await update_user_conversation(cb.message.chat.id, {
+        "stage": "awaiting_media_file",
+        "job_id": job_id,
+        "job_dir": job_dir
+    })
+    try:
+        await cb.message.edit_text("🎵 **Send File**\n\nSend the file you want to process.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]]))
+    except:
+        pass
 
 @bot.on_callback_query(filters.regex("^cancel_conv$") & admin_filter)
 async def cancel_conversation_handler(client, cb: CallbackQuery):
@@ -586,7 +623,7 @@ async def cancel_conversation_handler(client, cb: CallbackQuery):
         pass
     await start_command(client, cb.message)
 
-# Watermark settings menu
+# Watermark settings menu (now includes position toggles)
 @bot.on_callback_query(filters.regex("^watermark_settings$") & admin_filter)
 async def watermark_settings_cb(client, cb: CallbackQuery):
     await cb.answer()
@@ -594,21 +631,27 @@ async def watermark_settings_cb(client, cb: CallbackQuery):
     admin_wm = await get_admin_watermark(cb.from_user.id)
     text = "**⚙️ Watermark Settings**\n\n"
     if owner_wm.get("file_id"):
-        text += f"🟢 Owner watermark is set.\nVolume: `{int(owner_wm.get('volume',0.2)*100)}%`\nPosition: `{owner_wm.get('position_mode')}`\n\n"
+        text += f"🟢 Owner watermark is set.\nVolume: `{int(owner_wm.get('volume',0.2)*100)}%`\nPositions: `{', '.join(owner_wm.get('positions',[]))}`\n\n"
     else:
         text += "🔴 Owner watermark is not set.\n\n"
     if admin_wm:
-        text += f"🧑‍💼 Your personal watermark is set (Volume {int(admin_wm.get('volume',0.2)*100)}%).\n\n"
-    text += "You can upload, manage, or change watermark position.\n"
-    buttons = [
+        text += f"🧑‍💼 Your personal watermark is set (Volume {int(admin_wm.get('volume',0.2)*100)}%). Positions: `{', '.join(admin_wm.get('positions',[]))}`\n\n"
+    text += "You can upload, manage, or change watermark positions (toggle multiple positions)."
+    owner_buttons = [
         [InlineKeyboardButton("⬆️ Upload Owner Watermark", callback_data="owner_wm_upload")],
         [InlineKeyboardButton("🔊 Set Volume (Owner)", callback_data="owner_wm_volume")],
-        [InlineKeyboardButton("📍 Set Position (Owner)", callback_data="owner_wm_position")],
-        [InlineKeyboardButton("⬆️ Upload Your Watermark (Admin)", callback_data="admin_wm_upload")],
+        [InlineKeyboardButton("📍 Set Positions (Owner)", callback_data="owner_wm_positions")],
         [InlineKeyboardButton("🗑️ Delete Owner Watermark", callback_data="owner_wm_delete")],
+    ]
+    admin_buttons = [
+        [InlineKeyboardButton("⬆️ Upload Your Watermark (Admin)", callback_data="admin_wm_upload")],
+        [InlineKeyboardButton("📍 Set Positions (Admin)", callback_data="admin_wm_positions")]
+    ]
+    base = [
         [InlineKeyboardButton("⬅️ Back", callback_data="audio_tools_menu")]
     ]
-    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    kb = InlineKeyboardMarkup(owner_buttons + admin_buttons + base)
+    await cb.message.edit_text(text, reply_markup=kb)
 
 # Owner/ Admin watermark upload handlers
 @bot.on_callback_query(filters.regex("^owner_wm_upload$") & filters.user(Config.OWNER_ID))
@@ -644,46 +687,96 @@ async def owner_wm_vol_save(client, cb: CallbackQuery):
     await cb.answer(f"Volume set to {int(vol*100)}%.")
     await watermark_settings_cb(client, cb)
 
-@bot.on_callback_query(filters.regex("^owner_wm_position$") & filters.user(Config.OWNER_ID))
-async def owner_wm_position_cb(client, cb: CallbackQuery):
+# Owner positions toggle UI
+@bot.on_callback_query(filters.regex("^owner_wm_positions$") & filters.user(Config.OWNER_ID))
+async def owner_wm_positions_cb(client, cb: CallbackQuery):
     await cb.answer()
-    await cb.message.edit_text("📍 Choose watermark position:", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("Start + End (Default)", callback_data="owner_wm_pos_start_end")],
-        [InlineKeyboardButton("Start Only", callback_data="owner_wm_pos_start")],
-        [InlineKeyboardButton("End Only", callback_data="owner_wm_pos_end")],
-        [InlineKeyboardButton("Custom (Seconds)", callback_data="owner_wm_pos_custom")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]
-    ]))
+    owner_wm = await get_owner_watermark()
+    current = set(owner_wm.get("positions", ["start","end"]))
+    # build toggle buttons with checkmarks
+    def mk_btn(name):
+        mark = "✅" if name in current else "❌"
+        return InlineKeyboardButton(f"{mark} {name.capitalize()}", callback_data=f"owner_togglepos_{name}")
+    kb = InlineKeyboardMarkup([
+        [mk_btn("start"), mk_btn("middle")],
+        [mk_btn("end"), InlineKeyboardButton("Custom", callback_data="owner_pos_custom_prompt")],
+        [InlineKeyboardButton("➡️ Done", callback_data="owner_pos_done"), InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]
+    ])
+    await cb.message.edit_text("📍 Toggle positions to apply owner watermark at multiple timestamps:", reply_markup=kb)
 
-@bot.on_callback_query(filters.regex("^owner_wm_pos_start_end$") & filters.user(Config.OWNER_ID))
-async def owner_wm_pos_start_end(client, cb: CallbackQuery):
-    await set_owner_watermark_position("start_end", 0)
-    await cb.answer("Position set to Start+End.")
-    await watermark_settings_cb(client, cb)
-
-@bot.on_callback_query(filters.regex("^owner_wm_pos_start$") & filters.user(Config.OWNER_ID))
-async def owner_wm_pos_start_only(client, cb: CallbackQuery):
-    await set_owner_watermark_position("start_only", 0)
-    await cb.answer("Position set to Start Only.")
-    await watermark_settings_cb(client, cb)
-
-@bot.on_callback_query(filters.regex("^owner_wm_pos_end$") & filters.user(Config.OWNER_ID))
-async def owner_wm_pos_end_only(client, cb: CallbackQuery):
-    await set_owner_watermark_position("end_only", 0)
-    await cb.answer("Position set to End Only.")
-    await watermark_settings_cb(client, cb)
-
-@bot.on_callback_query(filters.regex("^owner_wm_pos_custom$") & filters.user(Config.OWNER_ID))
-async def owner_wm_pos_custom_prompt(client, cb: CallbackQuery):
+@bot.on_callback_query(filters.regex(r"^owner_togglepos_(start|middle|end)$") & filters.user(Config.OWNER_ID))
+async def owner_togglepos_cb(client, cb: CallbackQuery):
     await cb.answer()
-    await update_user_conversation(cb.message.chat.id, {"stage": "awaiting_owner_wm_custom_seconds"})
+    pos = cb.data.split("_")[-1]
+    owner_wm = await get_owner_watermark()
+    positions = set(owner_wm.get("positions", ["start","end"]))
+    if pos in positions:
+        positions.remove(pos)
+    else:
+        positions.add(pos)
+    if not positions:
+        positions = set(["start"])
+    await set_owner_watermark_positions(list(positions))
+    await owner_wm_positions_cb(client, cb)
+
+@bot.on_callback_query(filters.regex("^owner_pos_custom_prompt$") & filters.user(Config.OWNER_ID))
+async def owner_pos_custom_prompt(client, cb: CallbackQuery):
+    await cb.answer()
+    await update_user_conversation(cb.message.chat.id, {"stage": "awaiting_owner_pos_custom"})
     await cb.message.edit_text("🔢 Please send custom time in seconds (e.g., 1800 = 30 minutes).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="watermark_settings")]]))
+
+@bot.on_callback_query(filters.regex("^owner_pos_done$") & filters.user(Config.OWNER_ID))
+async def owner_pos_done_cb(client, cb: CallbackQuery):
+    await cb.answer()
+    await watermark_settings_cb(client, cb)
+
+# Admin positions toggle UI
+@bot.on_callback_query(filters.regex("^admin_wm_positions$") & admin_filter)
+async def admin_wm_positions_cb(client, cb: CallbackQuery):
+    await cb.answer()
+    admin_wm = await get_admin_watermark(cb.from_user.id) or {"positions":["start","end"]}
+    current = set(admin_wm.get("positions", ["start","end"]))
+    def mk_btn(name):
+        mark = "✅" if name in current else "❌"
+        return InlineKeyboardButton(f"{mark} {name.capitalize()}", callback_data=f"admin_togglepos_{name}")
+    kb = InlineKeyboardMarkup([
+        [mk_btn("start"), mk_btn("middle")],
+        [mk_btn("end"), InlineKeyboardButton("Custom", callback_data="admin_pos_custom_prompt")],
+        [InlineKeyboardButton("➡️ Done", callback_data="admin_pos_done"), InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]
+    ])
+    await cb.message.edit_text("📍 Toggle positions to apply your watermark at multiple timestamps:", reply_markup=kb)
+
+@bot.on_callback_query(filters.regex(r"^admin_togglepos_(start|middle|end)$") & admin_filter)
+async def admin_togglepos_cb(client, cb: CallbackQuery):
+    await cb.answer()
+    pos = cb.data.split("_")[-1]
+    admin_wm = await get_admin_watermark(cb.from_user.id) or {"positions":["start","end"], "custom_seconds":0}
+    positions = set(admin_wm.get("positions", ["start","end"]))
+    if pos in positions:
+        positions.remove(pos)
+    else:
+        positions.add(pos)
+    if not positions:
+        positions = set(["start"])
+    await update_admin_watermark_positions(cb.from_user.id, list(positions))
+    await admin_wm_positions_cb(client, cb)
+
+@bot.on_callback_query(filters.regex("^admin_pos_custom_prompt$") & admin_filter)
+async def admin_pos_custom_prompt(client, cb: CallbackQuery):
+    await cb.answer()
+    await update_user_conversation(cb.message.chat.id, {"stage": "awaiting_admin_pos_custom"})
+    await cb.message.edit_text("🔢 Please send custom time in seconds (e.g., 1800 = 30 minutes).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="watermark_settings")]]))
+
+@bot.on_callback_query(filters.regex("^admin_pos_done$") & admin_filter)
+async def admin_pos_done_cb(client, cb: CallbackQuery):
+    await cb.answer()
+    await watermark_settings_cb(client, cb)
 
 # Message handler for watermark uploads & custom seconds & admin watermark upload
 @bot.on_message(filters.private & (filters.audio | filters.video | filters.document | filters.text) & admin_filter)
 async def message_handler_router(client, message: Message):
     chat_id = message.chat.id
-    LOGGER.info(f"Incoming message from {message.from_user.id} - type audio={bool(message.audio)} video={bool(message.video)} doc={bool(message.document)} text={bool(message.text)}")
+    LOGGER.info(f"Incoming message from {message.from_user.id} - type audio={bool(message.audio)} video={bool(message.video)} doc={bool(message.document)} text={bool(message.text)} forward={bool(message.forward_from or message.forward_sender_name)}")
 
     # Debug: show conversation doc for this chat
     try:
@@ -693,9 +786,61 @@ async def message_handler_router(client, message: Message):
         LOGGER.error(f"Error reading conversation for chat {chat_id}: {e}", exc_info=True)
         conv = None
 
-    # If no conversation state, tell the user to start conversion flow
+    # If no conversation state and user sent a media file, create a session automatically
+    sent_media = None
+    if message.audio:
+        sent_media = ("audio", message.audio)
+    elif message.video:
+        sent_media = ("video", message.video)
+    elif message.document:
+        sent_media = ("document", message.document)
+    # Also treat voice as audio
+    elif getattr(message, "voice", None):
+        sent_media = ("audio", message.voice)
+
+    # Helper: determine if a document has an audio/video extension even if mime not set
+    async def doc_is_media(doc):
+        if not doc:
+            return False
+        mime = getattr(doc, "mime_type", "") or ""
+        filename = getattr(doc, "file_name", "") or ""
+        if mime.startswith("audio") or mime.startswith("video"):
+            return True
+        ext = safe_ext_from_filename(filename)
+        if ext in ["mka","mkv","mp3","m4a","aac","opus","flac","wav","ogg","mp4","mov","webm","m2ts"]:
+            return True
+        return False
+
+    # If no conv exists but user sent a media-like document, create job session so bot doesn't ignore
+    if not conv and sent_media:
+        # verify document file_type
+        if sent_media[0] == "document":
+            if not await doc_is_media(sent_media[1]):
+                # not a media-like document -> ignore and show guidance
+                try:
+                    await message.reply_text(
+                        "🔎 I did not find an active conversion session.\n\n"
+                        "Please press *Convert Audio* in the bot menu first (Audio Tools → Convert Audio),\n"
+                        "or press ➕ Send Audio/Video to start immediately, then send the file you want to process.",
+                        quote=True
+                    )
+                except Exception as e:
+                    LOGGER.warning(f"Failed to send session-missing guidance: {e}")
+                return
+        # Create a session automatically
+        job_id = str(uuid.uuid4())
+        job_dir = os.path.join(Config.DOWNLOAD_DIR, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        await update_user_conversation(chat_id, {
+            "stage": "awaiting_media_file",
+            "job_id": job_id,
+            "job_dir": job_dir
+        })
+        conv = await get_user_conversation(chat_id)
+        LOGGER.info(f"Auto-created session for chat {chat_id}, job {job_id}")
+
+    # If still no conversation, tell the user to start conversion flow
     if not conv:
-        # Do not spam owner; only guide the user
         try:
             await message.reply_text(
                 "🔎 I did not find an active conversion session.\n\n"
@@ -710,56 +855,87 @@ async def message_handler_router(client, message: Message):
     stage = conv.get("stage")
     LOGGER.debug(f"message_handler_router: chat {chat_id} stage={stage}")
 
+    # Owner uploading watermark
     if stage == "awaiting_owner_wm":
-        # must be from owner
         if message.from_user.id != Config.OWNER_ID:
             await message.reply_text("You don't have permission.")
             return
-        if not (message.audio or (message.document and getattr(message.document, "mime_type","").startswith("audio"))):
+        # Accept audio-like doc/video/audio
+        doc = message.audio or getattr(message, "voice", None) or message.document
+        if not doc or not await doc_is_media(doc):
             await message.reply_text("Please send an audio file (mp3/m4a).")
             return
-        file_id = message.audio.file_id if message.audio else message.document.file_id
+        file_id = doc.file_id
         await set_owner_watermark_file(file_id)
         await update_user_conversation(chat_id, None)
         await message.reply_text("✅ Owner watermark saved.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]]))
         return
 
+    # Admin uploading watermark
     if stage == "awaiting_admin_wm":
-        # admin uploads their own watermark
-        if not (message.audio or (message.document and getattr(message.document, "mime_type","").startswith("audio"))):
+        doc = message.audio or getattr(message, "voice", None) or message.document
+        if not doc or not await doc_is_media(doc):
             await message.reply_text("Please send an audio file (mp3/m4a).")
             return
-        file_id = message.audio.file_id if message.audio else message.document.file_id
-        await set_admin_watermark(message.from_user.id, file_id, volume=0.2, position_mode="start_end", custom_seconds=0)
+        file_id = doc.file_id
+        # Preserve admin defaults
+        await set_admin_watermark(message.from_user.id, file_id, volume=0.2, positions=["start","end"], custom_seconds=0)
         await update_user_conversation(chat_id, None)
         await message.reply_text("✅ Your watermark saved.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]]))
         return
 
-    if stage == "awaiting_owner_wm_custom_seconds":
-        # owner provided custom seconds
+    # Custom owner position seconds
+    if stage == "awaiting_owner_pos_custom":
         if message.from_user.id != Config.OWNER_ID:
             await message.reply_text("You don't have permission.")
             return
         try:
             secs = int(message.text.strip())
-            await set_owner_watermark_position("custom", secs)
+            owner_wm = await get_owner_watermark()
+            positions = owner_wm.get("positions", ["start","end"])
+            # store custom seconds as owner custom
+            await set_owner_watermark_positions(positions, custom_seconds=secs)
             await update_user_conversation(chat_id, None)
-            await message.reply_text(f"✅ Custom time set to {secs} seconds.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]]))
+            await message.reply_text(f"✅ Owner custom seconds set to {secs} seconds.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]]))
         except Exception:
             await message.reply_text("Please send a valid number (digits only).")
         return
-    
-    if stage == "awaiting_watermark_audio":
-        # handled earlier
-        pass
 
-    elif stage == "awaiting_media_file":
-        if not (message.audio or message.video or message.document):
+    # Custom admin position seconds
+    if stage == "awaiting_admin_pos_custom":
+        try:
+            secs = int(message.text.strip())
+            admin_wm = await get_admin_watermark(message.from_user.id) or {"positions":["start","end"]}
+            positions = admin_wm.get("positions", ["start","end"])
+            await update_admin_watermark_positions(message.from_user.id, positions, custom_seconds=secs)
+            await update_user_conversation(chat_id, None)
+            await message.reply_text(f"✅ Custom seconds set to {secs} seconds for your watermark.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="watermark_settings")]]))
+        except Exception:
+            await message.reply_text("Please send a valid number (digits only).")
+        return
+
+    # Awaiting owner/admin/wm custom seconds handled above
+
+    if stage == "awaiting_media_file":
+        # Accept media file even as document with various containers
+        if not (message.audio or message.video or message.document or getattr(message, "voice", None)):
             await message.reply_text("Please send a valid media file.")
             return
         await handle_media_file(client, message, conv)
+        return
 
-    elif stage == "awaiting_admin_id" and message.text:
+    if stage == "awaiting_wm_custom_seconds":
+        try:
+            secs = int(message.text.strip())
+            await update_user_conversation(message.chat.id, {"wm_position_mode": "custom", "wm_custom_seconds": secs, "stage": "processing"})
+            # proceed
+            fake_cb = CallbackQuery(id=None, from_user=message.from_user, message=message, chat_instance=None)
+            await ask_for_output_type(fake_cb, conv)
+        except Exception:
+            await message.reply_text("Please send a valid number (digits only).")
+        return
+
+    if stage == "awaiting_admin_id" and message.text:
         if message.from_user.id != Config.OWNER_ID:
             return
         try:
@@ -833,20 +1009,52 @@ async def convert_audio_start_cb(client, cb: CallbackQuery):
     await cb.message.edit_text("🎵 **Send File**\n\nSend the file you want to process.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]]))
 
 async def handle_media_file(client, message: Message, conv: dict):
-    media = message.audio or message.video or message.document
+    # This function downloads the incoming media, probes it, and asks the user to pick a track if multiple
+    media = message.audio or message.video or message.document or getattr(message, "voice", None)
     job_dir = conv.get("job_dir")
     if not job_dir or not os.path.isdir(job_dir):
         await message.reply_text("Error: Job directory not found. Please try again.", quote=True)
         asyncio.create_task(clear_conversation_after_delay(message.chat.id, delay=5))
         return
 
+    # capture original filename
+    original_filename = None
+    if message.document and getattr(message.document, "file_name", None):
+        original_filename = message.document.file_name
+    elif message.audio and getattr(message.audio, "file_name", None):
+        original_filename = message.audio.file_name
+    elif message.video and getattr(message.video, "file_name", None):
+        original_filename = message.video.file_name
+    else:
+        # try from caption or fallback to message media file_unique_id
+        original_filename = getattr(message, "caption", None) or f"file_{uuid.uuid4()}"
+    original_filename = sanitize_filename(original_filename)
+
+    # determine extension fallback
+    ext = safe_ext_from_filename(original_filename)
+    if not ext:
+        # choose reasonable ext based on media type
+        if message.video:
+            ext = "mkv"
+        elif message.audio or getattr(message, "voice", None):
+            ext = "m4a"
+        else:
+            ext = "dat"
+        original_filename = f"{original_filename}.{ext}"
+
+    input_target_name = f"input_{uuid.uuid4()}_{os.path.basename(original_filename)}"
+    input_file_path = os.path.join(job_dir, input_target_name)
+
     status_msg = await message.reply_text("📥 **Downloading... 0%**", quote=True)
     try:
-        input_file_path = await message.download(
-            file_name=os.path.join(job_dir, f"input_file_{uuid.uuid4()}"),
+        downloaded = await message.download(
+            file_name=input_file_path,
             progress=progress_callback,
             progress_args=(status_msg, "Downloading")
         )
+        # message.download returns path
+        if downloaded:
+            input_file_path = downloaded
     except Exception as e:
         LOGGER.error(f"File download failed: {e}", exc_info=True)
         try:
@@ -864,7 +1072,7 @@ async def handle_media_file(client, message: Message, conv: dict):
         await status_msg.edit_text("❌ **Error**\n\nNo audio streams found in this file.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]]))
         return
 
-    is_audio_only = message.audio or (message.document and getattr(message.document, "mime_type","").startswith("audio"))
+    is_audio_only = message.audio or (message.document and (getattr(message.document, "mime_type","") or "").startswith("audio")) or getattr(message, "voice", None)
     if not is_audio_only:
         all_streams_probe_cmd = f"ffprobe -v error -show_streams -of json {shlex.quote(input_file_path)}"
         try:
@@ -876,11 +1084,14 @@ async def handle_media_file(client, message: Message, conv: dict):
         except Exception:
             pass
 
+    # Save conv details
     await update_user_conversation(message.chat.id, {
         "input_file_path": input_file_path,
+        "original_filename": original_filename,
         "audio_streams": audio_streams,
         "is_audio_only": is_audio_only,
-        "job_dir": job_dir
+        "job_dir": job_dir,
+        "stage": "awaiting_track_selection"
     })
 
     buttons = []
@@ -940,17 +1151,30 @@ async def format_selection_cb(client, cb: CallbackQuery):
     if not conv or conv.get("stage") != "awaiting_format_selection":
         return await cb.answer("Session expired. Please start over.", show_alert=True)
 
-    format_choice = cb.data.split("_", 1)[1]
-    format_options = {
+    raw_choice = cb.data.split("_", 1)[1]
+    # normalize mapping keys used earlier
+    format_choice_map = {
         "aac_stereo": {"codec": "aac", "channels": 2, "bitrate": "192k"},
         "aac_5_1": {"codec": "aac", "channels": 6, "bitrate": "320k"},
         "mp3_stereo": {"codec": "libmp3lame", "channels": 2, "bitrate": "192k"},
-        "aac_copy": {"codec": "copy", "channels": "copy", "bitrate": "copy"}
+        "aac_copy": {"codec": "copy", "channels": "copy", "bitrate": "copy"},
     }
-    if format_choice not in format_options:
-        return await cb.answer("Invalid format.", show_alert=True)
+    # map incoming cb values
+    mapping = {
+        "aac_stereo": "aac_stereo",
+        "aac_5_1": "aac_5_1",
+        "mp3_stereo": "mp3_stereo",
+        "aac_copy": "aac_copy"
+    }
+    format_choice = raw_choice
+    if format_choice not in format_choice_map:
+        # sometimes cb contained other suffixes; fallback to detect 'copy'
+        if "copy" in format_choice:
+            format_choice = "aac_copy"
+        else:
+            return await cb.answer("Invalid format.", show_alert=True)
 
-    await update_user_conversation(chat_id, {"format": format_options[format_choice]})
+    await update_user_conversation(chat_id, {"format": format_choice_map[format_choice]})
 
     owner_wm = await get_owner_watermark()
     admin_wm = await get_admin_watermark(cb.from_user.id)
@@ -992,14 +1216,14 @@ async def watermark_selection_cb(client, cb: CallbackQuery):
 
     if choice == "owner":
         await update_user_conversation(chat_id, {"watermark": True, "watermark_choice": "owner"})
-        # ask about position specifics or use owner defaults
         owner_wm = await get_owner_watermark()
-        await cb.message.edit_text("Owner watermark selected.\n\nChange position?", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Start + End (Default)", callback_data="wmpos_owner_start_end")],
-            [InlineKeyboardButton("Start Only", callback_data="wmpos_owner_start")],
-            [InlineKeyboardButton("End Only", callback_data="wmpos_owner_end")],
-            [InlineKeyboardButton("Custom (Seconds)", callback_data="wmpos_owner_custom")],
-            [InlineKeyboardButton("➡️ Continue", callback_data="wmpos_owner_done")]
+        # set temporary positions in conversation (allow user to toggle additively)
+        await update_user_conversation(chat_id, {"wm_positions": owner_wm.get("positions", ["start","end"]), "wm_custom_seconds": owner_wm.get("custom_seconds", 0)})
+        # present toggle UI
+        await cb.message.edit_text("Owner watermark selected.\n\nToggle positions (you can select multiple):", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Start", callback_data="wm_toggle_start"), InlineKeyboardButton("Middle", callback_data="wm_toggle_middle")],
+            [InlineKeyboardButton("End", callback_data="wm_toggle_end"), InlineKeyboardButton("Custom", callback_data="wm_pos_custom_prompt")],
+            [InlineKeyboardButton("➡️ Continue", callback_data="wm_pos_done")]
         ]))
         await update_user_conversation(chat_id, {"stage": "awaiting_wm_position_choice"})
     elif choice == "admin":
@@ -1008,46 +1232,56 @@ async def watermark_selection_cb(client, cb: CallbackQuery):
             await cb.answer("Your watermark is not saved. Please upload first.", show_alert=True)
             return await watermark_settings_cb(client, cb)
         await update_user_conversation(chat_id, {"watermark": True, "watermark_choice": "admin"})
-        await cb.message.edit_text("Your watermark selected. Configure options:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Start + End", callback_data="wmpos_admin_start_end"), InlineKeyboardButton("Start Only", callback_data="wmpos_admin_start")],
-            [InlineKeyboardButton("End Only", callback_data="wmpos_admin_end"), InlineKeyboardButton("Custom", callback_data="wmpos_admin_custom")],
-            [InlineKeyboardButton("➡️ Continue", callback_data="wmpos_admin_done")]
+        await update_user_conversation(chat_id, {"wm_positions": admin_wm.get("positions", ["start","end"]), "wm_custom_seconds": admin_wm.get("custom_seconds", 0)})
+        await cb.message.edit_text("Your watermark selected. Toggle positions (you can select multiple):", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Start", callback_data="wm_toggle_start"), InlineKeyboardButton("Middle", callback_data="wm_toggle_middle")],
+            [InlineKeyboardButton("End", callback_data="wm_toggle_end"), InlineKeyboardButton("Custom", callback_data="wm_pos_custom_prompt")],
+            [InlineKeyboardButton("➡️ Continue", callback_data="wm_pos_done")]
         ]))
         await update_user_conversation(chat_id, {"stage": "awaiting_wm_position_choice"})
     else:
         await update_user_conversation(chat_id, {"watermark": False})
         await ask_for_output_type(cb, conv)
 
-# Watermark position callbacks (owner + admin)
-@bot.on_callback_query(filters.regex(r"^wmpos_(owner|admin)_(start_end|start|end|custom|done)$") & admin_filter)
-async def wmpos_choice_cb(client, cb: CallbackQuery):
+# Watermark position toggle callbacks (generic for owner/admin when in selection stage)
+@bot.on_callback_query(filters.regex(r"^wm_toggle_(start|middle|end)$") & admin_filter)
+async def wm_toggle_generic_cb(client, cb: CallbackQuery):
     await cb.answer()
-    parts = cb.data.split("_")
-    who = parts[1] if len(parts) > 1 else "owner"
-    option = parts[2]
+    choice = cb.data.split("_")[-1]
     chat_id = cb.message.chat.id
     conv = await get_user_conversation(chat_id)
     if not conv:
         return await cb.answer("Session expired.", show_alert=True)
-    if option == "start_end":
-        await update_user_conversation(chat_id, {"wm_position_mode": "start_end", "wm_custom_seconds": 0})
-        await cb.answer("Position set to Start+End.")
-        # proceed to output selection
-        await ask_for_output_type(cb, conv)
-    elif option == "start":
-        await update_user_conversation(chat_id, {"wm_position_mode": "start_only", "wm_custom_seconds": 0})
-        await cb.answer("Position set to Start Only.")
-        await ask_for_output_type(cb, conv)
-    elif option == "end":
-        await update_user_conversation(chat_id, {"wm_position_mode": "end_only", "wm_custom_seconds": 0})
-        await cb.answer("Position set to End Only.")
-        await ask_for_output_type(cb, conv)
-    elif option == "custom":
-        await update_user_conversation(chat_id, {"stage": "awaiting_wm_custom_seconds"})
-        await cb.message.edit_text("🔢 Please send time in seconds (e.g., 1800 = 30 minutes).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]]))
-    elif option == "done":
-        # done, use owner defaults (if any)
-        await ask_for_output_type(cb, conv)
+    current = set(conv.get("wm_positions", []))
+    if choice in current:
+        current.remove(choice)
+    else:
+        current.add(choice)
+    if not current:
+        current.add("start")
+    await update_user_conversation(chat_id, {"wm_positions": list(current)})
+    # reflect selections in UI by adding marks to text (simple re-render)
+    selected = ", ".join(sorted(list(current)))
+    await cb.message.edit_text(f"Selected positions: `{selected}`\n\nToggle more or press Continue.", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("Start", callback_data="wm_toggle_start"), InlineKeyboardButton("Middle", callback_data="wm_toggle_middle")],
+        [InlineKeyboardButton("End", callback_data="wm_toggle_end"), InlineKeyboardButton("Custom", callback_data="wm_pos_custom_prompt")],
+        [InlineKeyboardButton("➡️ Continue", callback_data="wm_pos_done")]
+    ]))
+
+@bot.on_callback_query(filters.regex("^wm_pos_custom_prompt$") & admin_filter)
+async def wm_pos_custom_prompt(client, cb: CallbackQuery):
+    await cb.answer()
+    await update_user_conversation(cb.message.chat.id, {"stage": "awaiting_wm_custom_seconds"})
+    await cb.message.edit_text("🔢 Please send custom time in seconds (e.g., 1800 = 30 minutes).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]]))
+
+@bot.on_callback_query(filters.regex("^wm_pos_done$") & admin_filter)
+async def wm_pos_done_cb(client, cb: CallbackQuery):
+    await cb.answer()
+    chat_id = cb.message.chat.id
+    conv = await get_user_conversation(chat_id)
+    if not conv:
+        return await cb.answer("Session expired.", show_alert=True)
+    await ask_for_output_type(cb, conv)
 
 @bot.on_message(filters.private & filters.text & admin_filter)
 async def custom_wm_seconds_handler(client, message: Message):
@@ -1055,19 +1289,17 @@ async def custom_wm_seconds_handler(client, message: Message):
     if not conv:
         return
     stage = conv.get("stage")
-    if stage == "awaiting_wm_custom_seconds":
+    if stage == "awaiting_wm_custom_seconds" or stage == "awaiting_owner_pos_custom" or stage == "awaiting_admin_pos_custom":
         try:
             secs = int(message.text.strip())
             await update_user_conversation(message.chat.id, {"wm_position_mode": "custom", "wm_custom_seconds": secs, "stage": "processing"})
             # proceed
-            # call ask_for_output_type manually since we don't have original cb
             fake_cb = CallbackQuery(id=None, from_user=message.from_user, message=message, chat_instance=None)
-            # use a tiny wrapper to call ask_for_output_type (we can craft conv)
             await ask_for_output_type(fake_cb, conv)
         except Exception:
             await message.reply_text("Please send a valid number (digits only).")
 
-# Output selection
+# Output selection (now includes "all")
 async def ask_for_output_type(cb, conv):
     chat_id = cb.message.chat.id
     if conv.get("is_audio_only"):
@@ -1080,12 +1312,12 @@ async def ask_for_output_type(cb, conv):
     else:
         await update_user_conversation(chat_id, {"stage": "awaiting_output_selection"})
         await cb.message.edit_text("✅ Settings complete.\n\nChoose output type:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎵 Audio Only (.m4a/.mp3)", callback_data="output_audio")],
-            [InlineKeyboardButton("🎬 Remux Video (.mkv)", callback_data="output_remux")],
+            [InlineKeyboardButton("🎵 Audio Only (.m4a/.mp3)", callback_data="output_audio"), InlineKeyboardButton("🎬 Remux Video (.mkv)", callback_data="output_remux")],
+            [InlineKeyboardButton("📦 All (Audio + Video)", callback_data="output_all")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]
         ]))
 
-@bot.on_callback_query(filters.regex(r"^output_(audio|remux)$") & admin_filter)
+@bot.on_callback_query(filters.regex(r"^output_(audio|remux|all)$") & admin_filter)
 async def output_selection_cb(client, cb: CallbackQuery):
     await cb.answer()
     chat_id = cb.message.chat.id
@@ -1098,33 +1330,44 @@ async def output_selection_cb(client, cb: CallbackQuery):
     await start_conversion_process(cb)
 
 # -------------------------------------------------------------------------------- #
-# FFmpeg args builder with watermark positioning (start, end, custom)
+# FFmpeg args builder with multi-position watermark positioning
 # -------------------------------------------------------------------------------- #
 
-async def build_ffmpeg_args(conv, input_file, watermark_local_file):
+async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_format=None, override_output_type=None):
+    """
+    Build FFmpeg args based on conversation. Supports multi-position watermarks list:
+    conv['wm_positions'] -> list like ['start','middle','end','custom']
+    custom seconds in conv['wm_custom_seconds'] if 'custom' selected
+    """
     track_index = conv["selected_track_index"]
     stream_obj = conv["selected_stream_obj"]
-    fmt = conv["format"]
+    fmt = override_format if override_format else conv.get("format")
     use_watermark = conv.get("watermark", False)
     watermark_choice = conv.get("watermark_choice", "owner") # owner or admin
     job_dir = conv["job_dir"]
-    wm_position_mode = conv.get("wm_position_mode") or "start_end"
+    wm_positions = conv.get("wm_positions", []) or []
     wm_custom_seconds = int(conv.get("wm_custom_seconds", 0) or 0)
 
+    output_type = override_output_type if override_output_type else conv.get("output_type")
     output_ext = "mp3" if fmt['codec'] == 'libmp3lame' else "m4a"
-    if conv.get("output_type") == "remux":
+    if output_type == "remux":
         output_ext = "mkv"
     elif fmt['codec'] == 'copy':
+        # keep container if audio-only original exists
         output_ext = "m4a"
 
-    final_output_file = os.path.join(job_dir, f"output.{output_ext}")
+    # build final output basename from original filename
+    original_filename = conv.get("original_filename") or f"output_{uuid.uuid4()}"
+    base_name, _ = os.path.splitext(original_filename)
+    final_basename = f"{base_name}.{output_ext}"
+    final_output_file = os.path.join(job_dir, final_basename)
 
     args = ["ffmpeg", "-y", "-hide_banner", "-i", input_file]
 
     filter_complex_parts = []
     audio_map_label = f"0:a:{track_index}"
 
-    # Determine which watermark file to use
+    # Determine which watermark file to use and its volume/positions
     wm_file_to_use = None
     wm_volume = 0.2
     wm_owner_description = "none"
@@ -1133,12 +1376,17 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file):
             owner_wm = await get_owner_watermark()
             wm_file_to_use = owner_wm.get("file_id")
             wm_volume = owner_wm.get("volume", 0.2)
+            # default positions set if not explicitly set in conversation
+            wm_positions = conv.get("wm_positions") or owner_wm.get("positions", ["start","end"])
+            wm_custom_seconds = conv.get("wm_custom_seconds") or owner_wm.get("custom_seconds") or 0
             wm_owner_description = "owner"
         else:
             admin_wm = await get_admin_watermark(conv.get("user_id") or 0)
             if admin_wm:
                 wm_file_to_use = admin_wm.get("file_id")
                 wm_volume = admin_wm.get("volume", 0.2)
+                wm_positions = conv.get("wm_positions") or admin_wm.get("positions", ["start","end"])
+                wm_custom_seconds = conv.get("wm_custom_seconds") or admin_wm.get("custom_seconds") or 0
                 wm_owner_description = f"admin:{conv.get('user_id')}"
 
     # If copy selected but watermark requested, we will force a re-encode (can't mix in copy mode).
@@ -1147,60 +1395,67 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file):
         force_reencode = True
 
     # If watermark exists and we have a local watermark file (downloaded earlier)
-    if use_watermark and watermark_local_file and not force_reencode:
-        # prepare 2-input filter
+    if use_watermark and watermark_local_file:
+        # plan: add watermark as second input and as many delayed streams as positions selected
         args.extend(["-i", watermark_local_file])
-        # simple start: mix at start, no delay
-        if wm_position_mode == "start_only":
-            filter_complex_parts.append(f"[0:a:{track_index}]volume=1.0[main]")
-            filter_complex_parts.append(f"[1:a]adelay=0|0,volume={wm_volume}[wm]")
-            filter_complex_parts.append(f"[main][wm]amix=inputs=2:duration=first[aud_out]")
-        elif wm_position_mode == "end_only":
-            # compute delay later at runtime by substituting placeholder
-            input_duration = await get_media_duration(input_file)
-            # choose watermark duration
-            try:
-                wm_dur = await get_media_duration(watermark_local_file)
-            except:
-                wm_dur = 0
-            delay_ms = max(0, int((input_duration - wm_dur) * 1000))
-            filter_complex_parts.append(f"[0:a:{track_index}]volume=1.0[main]")
-            filter_complex_parts.append(f"[1:a]adelay={delay_ms}|{delay_ms},volume={wm_volume}[wm]")
-            filter_complex_parts.append(f"[main][wm]amix=inputs=2:duration=first[aud_out]")
-        elif wm_position_mode == "custom":
-            delay_ms = max(0, int(wm_custom_seconds * 1000))
-            filter_complex_parts.append(f"[0:a:{track_index}]volume=1.0[main]")
-            filter_complex_parts.append(f"[1:a]adelay={delay_ms}|{delay_ms},volume={wm_volume}[wm]")
-            filter_complex_parts.append(f"[main][wm]amix=inputs=2:duration=first[aud_out]")
-        else:  # default start_end
-            # We'll mix twice: start and end.
-            input_duration = await get_media_duration(input_file)
-            try:
-                wm_dur = await get_media_duration(watermark_local_file)
-            except:
-                wm_dur = 0
-            # end delay ms = clamp so end occurs within first hour if necessary
-            max_within = 3600
-            end_target = input_duration if input_duration <= max_within else max_within
-            delay_ms = max(0, int((end_target - wm_dur) * 1000))
-            filter_complex_parts.append(f"[1:a]asplit=2[wm1][wm2]")
-            filter_complex_parts.append(f"[0:a:{track_index}]volume=1.0[main]")
-            filter_complex_parts.append(f"[wm1]volume={wm_volume}[wm_start]")
-            # end delay compute
-            filter_complex_parts.append(f"[wm2]adelay={delay_ms}|{delay_ms},volume={wm_volume}[wm_end]")
-            filter_complex_parts.append(f"[main][wm_start][wm_end]amix=inputs=3:duration=first[aud_out]")
+        # determine durations
+        input_duration = await get_media_duration(input_file)
+        try:
+            wm_dur = await get_media_duration(watermark_local_file)
+        except:
+            wm_dur = 0.0
 
-        audio_map_label = "[aud_out]"
+        # compute position timestamps in seconds for each selected position (start=0, middle center, end align)
+        positions = []
+        for p in wm_positions:
+            if p == "start":
+                positions.append(0.0)
+            elif p == "middle":
+                positions.append(max(0.0, (input_duration / 2.0) - (wm_dur / 2.0)))
+            elif p == "end":
+                positions.append(max(0.0, input_duration - wm_dur))
+            elif p == "custom":
+                positions.append(max(0.0, float(wm_custom_seconds)))
+        # deduplicate and sort ascending
+        unique_positions = sorted(set([int(max(0, p)) for p in positions]))
+
+        # Build filter_complex:
+        # - [1:a]asplit=N -> [wm0][wm1]...
+        # - for each wm_i: adelay=pos_ms|pos_ms,volume=wm_volume -> [wm_i_out]
+        # - [0:a:track_index]volume=1.0[main]
+        # - then amix inputs=(1 + N) of all [main] + [wm_i_out]
+        n_wms = len(unique_positions)
+        if n_wms == 0:
+            audio_map_label = f"0:a:{track_index}"
+        else:
+            # split watermark track into n copies
+            filter_complex_parts.append(f"[1:a]asplit={n_wms}" + "".join([f"[wm{i}]" for i in range(n_wms)]))
+            filter_complex_parts.append(f"[0:a:{track_index}]volume=1.0[main]")
+            wm_out_labels = []
+            for i, pos_sec in enumerate(unique_positions):
+                delay_ms = int(round(pos_sec * 1000))
+                # adelay expects channel-delays separated by |
+                filter_complex_parts.append(f"[wm{i}]adelay={delay_ms}|{delay_ms},volume={wm_volume}[wm{i}_out]")
+                wm_out_labels.append(f"[wm{i}_out]")
+            # combine
+            all_inputs = "[main]" + "".join(wm_out_labels)
+            amix_inputs = 1 + n_wms
+            filter_complex_parts.append(f"{all_inputs}amix=inputs={amix_inputs}:duration=first[aud_out]")
+            audio_map_label = "[aud_out]"
+
+        # If forcing re-encode due to copy selection, override fmt
+        if force_reencode and fmt.get("codec") == "copy":
+            fmt = {"codec": "aac", "channels": 2, "bitrate": "192k"}
 
     elif use_watermark and watermark_local_file and force_reencode:
-        # Downloaded watermark but chosen copy mode: force reencode path
+        # fallback - similar approach (shouldn't reach due to above block)
         args.extend(["-i", watermark_local_file])
-        # same mixing strategy as above for default start_end
         input_duration = await get_media_duration(input_file)
         try:
             wm_dur = await get_media_duration(watermark_local_file)
         except:
             wm_dur = 0
+        # default start+end
         max_within = 3600
         end_target = input_duration if input_duration <= max_within else max_within
         delay_ms = max(0, int((end_target - wm_dur) * 1000))
@@ -1210,10 +1465,8 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file):
         filter_complex_parts.append(f"[wm2]adelay={delay_ms}|{delay_ms},volume={wm_volume}[wm_end]")
         filter_complex_parts.append(f"[main][wm_start][wm_end]amix=inputs=3:duration=first[aud_out]")
         audio_map_label = "[aud_out]"
-        # override codec to ensure re-encode
         if fmt.get("codec") == "copy":
             fmt = {"codec": "aac", "channels": 2, "bitrate": "192k"}
-
     else:
         # no watermark -> map existing audio directly
         audio_map_label = f"0:a:{track_index}"
@@ -1233,7 +1486,8 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file):
     lang = (stream_obj or {}).get("tags", {}).get("language", "und")
     args.extend([f"-metadata:s:a:0", f"language={lang}"])
 
-    if conv.get("output_type") == "remux":
+    if output_type == "remux":
+        # include video and subtitles if present
         args.extend(["-map", "0:v:0?", "-map", "0:s?"])
         args.extend(["-c:v", "copy", "-c:s", "copy"])
 
@@ -1242,6 +1496,7 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file):
 
 # -------------------------------------------------------------------------------- #
 # Conversion process: download watermark, build args, run ffmpeg with progress, upload and save job metadata
+# Supports output_type 'audio', 'remux', 'all'
 # -------------------------------------------------------------------------------- #
 
 async def start_conversion_process(cb: CallbackQuery):
@@ -1268,7 +1523,7 @@ async def start_conversion_process(cb: CallbackQuery):
             conv["user_id"] = user_id
 
             watermark_local = None
-            wm_info = {"applied": False, "which": None, "position": None, "volume": None}
+            wm_info = {"applied": False, "which": None, "positions": None, "volume": None}
 
             # download watermark if needed
             if use_watermark:
@@ -1276,18 +1531,18 @@ async def start_conversion_process(cb: CallbackQuery):
                     owner_wm = await get_owner_watermark()
                     wm_file_id = owner_wm.get("file_id")
                     wm_vol = owner_wm.get("volume", 0.2)
-                    wm_pos = conv.get("wm_position_mode") or owner_wm.get("position_mode", "start_end")
+                    wm_pos = conv.get("wm_positions") or owner_wm.get("positions", ["start","end"])
                     wm_custom = conv.get("wm_custom_seconds") or owner_wm.get("custom_seconds", 0)
                     wm_max_within = owner_wm.get("max_within_seconds", 3600)
-                    wm_info.update({"which": "owner", "volume": wm_vol, "position": wm_pos, "custom": wm_custom, "max_within_seconds": wm_max_within})
+                    wm_info.update({"which": "owner", "volume": wm_vol, "positions": wm_pos, "custom": wm_custom, "max_within_seconds": wm_max_within})
                 else:
                     admin_wm = await get_admin_watermark(user_id)
                     if admin_wm:
                         wm_file_id = admin_wm.get("file_id")
                         wm_vol = admin_wm.get("volume", 0.2)
-                        wm_pos = conv.get("wm_position_mode") or admin_wm.get("position_mode", "start_end")
+                        wm_pos = conv.get("wm_positions") or admin_wm.get("positions", ["start","end"])
                         wm_custom = conv.get("wm_custom_seconds") or admin_wm.get("custom_seconds", 0)
-                        wm_info.update({"which": "admin", "volume": wm_vol, "position": wm_pos, "custom": wm_custom})
+                        wm_info.update({"which": "admin", "volume": wm_vol, "positions": wm_pos, "custom": wm_custom})
                     else:
                         wm_file_id = None
 
@@ -1312,21 +1567,71 @@ async def start_conversion_process(cb: CallbackQuery):
 
             total_duration = await get_media_duration(input_file)
 
-            # Build ffmpeg args
-            ffmpeg_args, final_output_file = await build_ffmpeg_args(conv, input_file, watermark_local)
+            # Process logic for output types:
+            uploaded_files = []
+            # helper to run a single conversion (build args, run ffmpeg, upload)
+            async def run_single_conversion_and_upload(local_conv, out_type, out_fmt=None):
+                # build ffmpeg args
+                ffmpeg_args, final_output_file = await build_ffmpeg_args(local_conv, input_file, watermark_local, override_format=out_fmt, override_output_type=out_type)
+                # run ffmpeg with progress
+                # update status_msg to "Converting..."
+                try:
+                    await status_msg.edit_text("🔁 **Converting...**")
+                except:
+                    pass
+                await run_ffmpeg_with_progress(ffmpeg_args, total_duration, status_msg, job_id, update_every=Config.PROGRESS_UPDATE_INTERVAL)
+                # check output
+                if not os.path.exists(final_output_file):
+                    raise Exception("Conversion completed, but output file not found.")
+                output_file_size = os.path.getsize(final_output_file)
+                if output_file_size > Config.TELEGRAM_MAX_FILE_SIZE:
+                    size_gb = output_file_size / (1024**3)
+                    await status_msg.edit_text(f"❌ **Upload failed**\n\nConverted file is {size_gb:.2f} GB, which is over Telegram's limit.")
+                    return None, None
+                # prepare caption info
+                info_block = "✅ **Conversion Complete!**\n\n"
+                ffcodec = out_fmt.get('codec') if out_fmt else (local_conv.get("format") or {}).get('codec')
+                info_block += f"Format: `{ffcodec}`\n"
+                info_block += f"Watermark Applied: `{'Yes' if local_conv.get('watermark') else 'No'}`\n"
+                if local_conv.get('watermark') and wm_info.get("applied"):
+                    info_block += f"Watermark: `{wm_info.get('which')}`\n"
+                    info_block += f"Positions: `{', '.join(wm_info.get('positions') or [])}`\n"
+                    info_block += f"Volume: `{int(wm_info.get('volume',0.2)*100)}%`\n"
+                info_block += f"Output Size: `{human_size(output_file_size)}`\n"
+                info_block += f"Job ID: `{job_id}`\n"
+                await status_msg.edit_text("✅ **Conversion Complete!**\n\nUploading result...")
+                # upload file
+                await bot.send_document(
+                    chat_id,
+                    document=final_output_file,
+                    caption=info_block,
+                    progress=progress_callback,
+                    progress_args=(status_msg, "Uploading")
+                )
+                uploaded_files.append(final_output_file)
+                return final_output_file, output_file_size
 
-            # run ffmpeg with progress
-            await run_ffmpeg_with_progress(ffmpeg_args, total_duration, status_msg, job_id, update_every=Config.PROGRESS_UPDATE_INTERVAL)
-
-            # Post-process: check final file
-            if not os.path.exists(final_output_file):
-                raise Exception("Conversion completed, but output file not found.")
-
-            output_file_size = os.path.getsize(final_output_file)
-            if output_file_size > Config.TELEGRAM_MAX_FILE_SIZE:
-                size_gb = output_file_size / (1024**3)
-                await status_msg.edit_text(f"❌ **Upload failed**\n\nConverted file is {size_gb:.2f} GB, which is over Telegram's limit.")
-                return
+            if output_type == "audio":
+                # single audio conversion
+                final_file, size = await run_single_conversion_and_upload(conv, "audio", out_fmt=fmt)
+            elif output_type == "remux":
+                # remux video/keep video
+                final_file, size = await run_single_conversion_and_upload(conv, "remux", out_fmt=fmt)
+            elif output_type == "all":
+                # first: audio (convert as audio)
+                # create a shallow copy of conv for audio run (so we can reuse conv for video)
+                conv_audio = dict(conv)
+                conv_audio["output_type"] = "audio"
+                final_audio_file, audio_size = await run_single_conversion_and_upload(conv_audio, "audio", out_fmt=fmt)
+                # second: remux video and upload
+                conv_video = dict(conv)
+                conv_video["output_type"] = "remux"
+                final_video_file, video_size = await run_single_conversion_and_upload(conv_video, "remux", out_fmt=fmt)
+                # after both uploaded, set final_file to audio (primary)
+                final_file = final_audio_file or final_video_file
+                size = (audio_size or 0) + (video_size or 0)
+            else:
+                raise Exception("Unknown output type requested.")
 
             # Save job metadata to DB
             job_doc = {
@@ -1334,35 +1639,15 @@ async def start_conversion_process(cb: CallbackQuery):
                 "chat_id": chat_id,
                 "user_id": user_id,
                 "input_file": input_file,
-                "output_file": final_output_file,
-                "output_size": output_file_size,
+                "output_files": uploaded_files,
+                "output_size": sum([os.path.getsize(f) for f in uploaded_files]) if uploaded_files else 0,
                 "format": fmt,
                 "watermark": wm_info,
                 "timestamp": datetime.utcnow()
             }
             await jobs_collection.insert_one(job_doc)
 
-            # Prepare final caption info block
-            info_block = "✅ **Conversion Complete!**\n\n"
-            info_block += f"Format: `{fmt.get('codec')}`\n"
-            info_block += f"Watermark Applied: `{'Yes' if use_watermark else 'No'}`\n"
-            if wm_info.get("applied"):
-                info_block += f"Watermark: `{wm_info.get('which')}`\n"
-                info_block += f"Position: `{wm_info.get('position')}`\n"
-                info_block += f"Volume: `{int(wm_info.get('volume',0.2)*100)}%`\n"
-            info_block += f"Output Size: `{human_size(output_file_size)}`\n"
-            info_block += f"Job ID: `{job_id}`\n"
-
-            await status_msg.edit_text("✅ **Conversion Complete!**\n\nUploading result...")
-
-            # Upload output file
-            await bot.send_document(
-                chat_id,
-                document=final_output_file,
-                caption=info_block,
-                progress=progress_callback,
-                progress_args=(status_msg, "Uploading")
-            )
+            # cleanup UI
             try:
                 await status_msg.delete()
             except:
@@ -1381,9 +1666,10 @@ async def start_conversion_process(cb: CallbackQuery):
             except:
                 pass
         finally:
-            # cleanup job_dir
+            # cleanup job_dir (must remove after BOTH uploaded in 'all' case)
             try:
-                job_dir = conv.get("job_dir")
+                conv_latest = await get_user_conversation(chat_id)
+                job_dir = conv_latest.get("job_dir") if conv_latest else conv.get("job_dir")
                 if job_dir and os.path.isdir(job_dir):
                     shutil.rmtree(job_dir)
                     LOGGER.info(f"Cleaned up job directory: {job_dir}")
