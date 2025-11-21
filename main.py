@@ -324,38 +324,69 @@ async def safe_edit(message, text, reply_markup=None):
         LOGGER.warning(f"Failed to edit message: {e}")
 
 # -------------------------------------------------------------------------------- #
-# Run ffmpeg with progress parsing + cancel support (improved)
+# Run ffmpeg with progress parsing + cancel support (fixed)
 # -------------------------------------------------------------------------------- #
 
-async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg, job_id, update_every=Config.PROGRESS_UPDATE_INTERVAL):
+async def run_ffmpeg_with_progress(
+    args_list,
+    total_duration_seconds,
+    status_msg,
+    job_id,
+    update_every=Config.PROGRESS_UPDATE_INTERVAL,
+):
     """
-    Runs ffmpeg with -progress pipe:1, parses out_time_ms, updates the status_msg with progress.
+    Runs ffmpeg with -progress pipe:1, parses out_time_ms/total_size,
+    and updates the status_msg with progress.
     Uses JOB_TRACKERS[job_id] to support cancellation.
-    FIX: Prevents premature 100% display until process exits successfully.
+    This version:
+      - Resets tracker state for every run (no stale 99%).
+      - Inserts -progress as a global option (right after 'ffmpeg').
+      - Updates bytes_processed for more accurate speed/ETA.
     """
-    # Ensure tracker entry
-    JOB_TRACKERS.setdefault(job_id, {"cancelled": False, "last_update": 0.0, "bytes_processed": 0, "start_ts": time.time(), "last_time": time.time(), "last_percent": 0.0})
 
+    # Hard reset tracker entry for this run
+    JOB_TRACKERS[job_id] = {
+        "cancelled": False,
+        "last_update": 0.0,
+        "bytes_processed": 0,
+        "start_ts": time.time(),
+        "last_time": time.time(),
+        "last_percent": 0.0,
+    }
+
+    # Ensure -progress is a global option (right after 'ffmpeg')
     if "-progress" not in args_list:
-        args_list.extend(["-progress", "pipe:1", "-nostats"])
+        try:
+            # Typical case: args_list[0] == "ffmpeg"
+            if args_list and args_list[0].lower().endswith("ffmpeg"):
+                insert_at = 1
+                args_list[insert_at:insert_at] = ["-progress", "pipe:1", "-nostats"]
+            else:
+                # Fallback: prepend ffmpeg + progress options
+                args_list = ["ffmpeg", "-progress", "pipe:1", "-nostats"] + list(args_list)
+        except Exception as e:
+            LOGGER.warning(f"Failed to inject -progress as global option: {e}")
+            args_list.extend(["-progress", "pipe:1", "-nostats"])
 
     LOGGER.info(f"Running ffmpeg: {' '.join(args_list)}")
+
     process = await asyncio.create_subprocess_exec(
         *args_list,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
     )
 
     out_time_ms = 0
     total_size = 0
     percent = 0.0
 
-    # prepare cancel button
-    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancel", callback_data=f"cancel_job|{job_id}")]])
+    cancel_kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⛔ Cancel", callback_data=f"cancel_job|{job_id}")]]
+    )
 
     try:
         while True:
-            # Check cancellation frequently
+            # Cancellation check
             if JOB_TRACKERS[job_id]["cancelled"]:
                 LOGGER.info(f"Job {job_id} cancelled by user. Terminating ffmpeg...")
                 try:
@@ -368,65 +399,81 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
             line = await process.stdout.readline()
             if not line:
                 break
-            text = line.decode('utf-8', errors='ignore').strip()
+
+            text = line.decode("utf-8", errors="ignore").strip()
             if not text:
                 continue
 
-            # parse key=value
-            if '=' in text:
-                k, v = text.split('=', 1)
-                k = k.strip(); v = v.strip()
+            # Parse key=value from ffmpeg -progress
+            if "=" in text:
+                k, v = text.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+
                 if k == "out_time_ms":
                     try:
                         out_time_ms = int(v)
-                    except:
+                    except Exception:
                         out_time_ms = 0
+
                 elif k == "total_size":
                     try:
                         total_size = int(v)
-                    except:
+                        JOB_TRACKERS[job_id]["bytes_processed"] = total_size
+                    except Exception:
                         total_size = 0
+
                 elif k == "progress" and v == "end":
-                    # FIX: Do NOT set 100% here. Cap it slightly below 100%
+                    # Do not set 100% in the loop; final 100% will be set after exit
                     percent = max(percent, 99.9)
 
-            # compute percent using time if possible (preferred)
+            # Compute percent from duration if available
             if total_duration_seconds and out_time_ms:
-                processed_seconds = out_time_ms / 1000.0
-                percent = min(100.0, (processed_seconds / total_duration_seconds) * 100.0)
-                # Keep it below 100% until final exit
-                if percent >= 100.0: percent = 99.99 
+                processed_seconds = out_time_ms / 1000000.0  # out_time_ms is in microseconds
+                percent = (processed_seconds / total_duration_seconds) * 100.0
+                if percent >= 100.0:
+                    percent = 99.99
             else:
-                # Fallback, mostly rely on previous percent
+                # Fallback: keep previous percent to avoid jumping around
                 percent = JOB_TRACKERS[job_id].get("last_percent", percent)
 
             now = time.time()
             if now - JOB_TRACKERS[job_id]["last_update"] > update_every:
-                # compute speed roughly from out_time_ms progression if possible or from size/time if available
                 elapsed = now - JOB_TRACKERS[job_id]["start_ts"]
-                size_for_speed = total_size if total_size else JOB_TRACKERS[job_id].get("bytes_processed", 0)
+
+                size_for_speed = (
+                    total_size
+                    if total_size
+                    else JOB_TRACKERS[job_id].get("bytes_processed", 0)
+                )
                 speed = (size_for_speed / elapsed) if elapsed > 0 else 0.0
+
                 bar = progress_bar(percent, length=20)
+
                 eta_seconds = None
                 if speed > 0 and total_size and size_for_speed < total_size:
                     remaining = max(0, total_size - size_for_speed)
                     eta_seconds = remaining / speed
                 elif total_duration_seconds and percent > 0:
-                    # estimate remaining time from percent
-                    eta_seconds = (total_duration_seconds * (100.0 - percent) / percent)
+                    eta_seconds = (
+                        total_duration_seconds * (100.0 - percent) / percent
+                    )
 
-                eta_str = format_time(eta_seconds) if eta_seconds is not None else "--:--:--"
+                eta_str = (
+                    format_time(eta_seconds) if eta_seconds is not None else "--:--:--"
+                )
 
                 txt = (
                     f"**Converting Progress:** {bar}\n\n"
                     f"📊 **Percentage:** {percent:.2f}%\n\n"
-                    f"⏳ **Elapsed:** {format_time(now - JOB_TRACKERS[job_id]['start_ts'])}\n\n"
+                    f"⏳ **Elapsed:** {format_time(elapsed)}\n\n"
                     f"🚀 **Speed:** {human_size(int(speed))}/s\n\n"
                     f"⏳ **ETA:** {eta_str}"
                 )
+
                 await safe_edit(status_msg, txt, reply_markup=cancel_kb)
+
                 JOB_TRACKERS[job_id]["last_update"] = now
-                JOB_TRACKERS[job_id]["last_size"] = total_size
                 JOB_TRACKERS[job_id]["last_percent"] = percent
 
     except asyncio.CancelledError as ce:
@@ -437,27 +484,28 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
         except Exception:
             pass
         raise
+
     except Exception as e:
-        # read remaining stderr
+        # Read remaining stderr for debugging
         try:
             stderr_acc = await process.stderr.read()
-            err_text = stderr_acc.decode('utf-8', errors='ignore')[:4000]
+            err_text = stderr_acc.decode("utf-8", errors="ignore")[:4000]
         except Exception:
             err_text = ""
         LOGGER.error(f"FFMPEG runtime error: {e}\nStderr: {err_text}")
         try:
             process.terminate()
-        except:
+        except Exception:
             pass
         raise RuntimeError(f"FFMPEG runtime error: {e}\n{err_text}")
+
     finally:
-        # wait for process to finish if not already
         try:
             rc = await process.wait()
         except Exception:
             rc = None
-        
-    # FIX: Only set 100% on successful exit
+
+    # Final 100% update only on successful exit
     if rc == 0:
         try:
             final_txt = (
@@ -467,19 +515,33 @@ async def run_ffmpeg_with_progress(args_list, total_duration_seconds, status_msg
                 f"🚀 **Speed:** {human_size(0)}/s\n\n"
                 f"⏳ **ETA:** 00:00:00"
             )
-            await safe_edit(status_msg, final_txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancel", callback_data=f"cancel_job|{job_id}")]]))
+            await safe_edit(
+                status_msg,
+                final_txt,
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⛔ Cancel", callback_data=f"cancel_job|{job_id}"
+                            )
+                        ]
+                    ]
+                ),
+            )
         except Exception:
             pass
     elif rc and rc != 0:
         try:
             stderr_data = await process.stderr.read()
-            err_text = stderr_data.decode('utf-8', errors='ignore')[:4000]
-        except:
+            err_text = stderr_data.decode("utf-8", errors="ignore")[:4000]
+        except Exception:
             err_text = ""
         LOGGER.error(f"FFMPEG failed (rc={rc}): {err_text}")
         raise RuntimeError(f"FFMPEG failed. {err_text}")
 
     LOGGER.info("FFMPEG finished successfully.")
+    # Optional: remove tracker entry for completed job
+    JOB_TRACKERS.pop(job_id, None)
     return True
 
 # -------------------------------------------------------------------------------- #
@@ -1440,6 +1502,8 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_for
     Build FFmpeg args based on conversation. Supports multi-position watermarks list:
     - Start at 3 minutes (180s).
     - End at 7 minutes (420s) before video finish.
+    - FIX: Uses absolute stream index (0:index) instead of relative audio index (0:a:index)
+      to prevent wrong language selection.
     """
     track_index = conv["selected_track_index"]
     stream_obj = conv["selected_stream_obj"]
@@ -1467,25 +1531,26 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_for
     args = ["ffmpeg", "-y", "-hide_banner", "-i", input_file]
 
     filter_complex_parts = []
-    audio_map_label = f"0:a:{track_index}"
+    
+    # FIX: Use Absolute Indexing "0:{index}" NOT "0:a:{index}"
+    # This solves the issue where selecting Malayalam (Track 2) converts Tamil (Track 3)
+    audio_map_label = f"0:{track_index}"
 
     # Determine which watermark file to use and its volume/positions
     wm_file_to_use = None
     wm_volume = 0.2
-    wm_owner_description = "none"
     wm_dur = 0.0
+    
     if use_watermark:
         if watermark_choice == "owner":
             owner_wm = await get_owner_watermark()
             wm_file_to_use = owner_wm.get("file_id")
             wm_volume = owner_wm.get("volume", 0.2)
-            wm_owner_description = "owner"
         else:
             admin_wm = await get_admin_watermark(conv.get("user_id") or 0)
             if admin_wm:
                 wm_file_to_use = admin_wm.get("file_id")
                 wm_volume = admin_wm.get("volume", 0.2)
-                wm_owner_description = f"admin:{conv.get('user_id')}"
 
     # If copy selected but watermark requested, we will force a re-encode (can't mix in copy mode).
     force_reencode = False
@@ -1520,14 +1585,10 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_for
                 # Exact middle
                 positions.append(max(0.0, (input_duration / 2.0) - (wm_dur / 2.0)))
             elif p == "end":
-                # End 7 minutes before video finishes (or just before end if too short)
-                # target_time is where the WM *starts*
+                # End 7 minutes before video finishes
                 target_time = input_duration - (WM_END_OFFSET + wm_dur)
-                
-                # Safety Check: If video is shorter than (7min + wm_dur), place it at the very end
                 if target_time < 0:
-                     target_time = max(0.0, input_duration - wm_dur)
-                
+                      target_time = max(0.0, input_duration - wm_dur)
                 positions.append(max(0.0, target_time))
             elif p == "custom":
                 positions.append(max(0.0, float(wm_custom_seconds)))
@@ -1537,19 +1598,20 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_for
 
         # Build filter_complex:
         n_wms = len(unique_positions)
-        if n_wms == 0:
-            # Should not happen if wm_positions is correctly initialized
-            audio_map_label = f"0:a:{track_index}"
-        else:
+        if n_wms > 0:
             # split watermark track into n copies
             filter_complex_parts.append(f"[1:a]asplit={n_wms}" + "".join([f"[wm{i}]" for i in range(n_wms)]))
-            filter_complex_parts.append(f"[0:a:{track_index}]volume=1.0[main]")
+            
+            # FIX: Map the specific track index correctly in filter
+            filter_complex_parts.append(f"[0:{track_index}]volume=1.0[main]")
+            
             wm_out_labels = []
             for i, pos_sec in enumerate(unique_positions):
                 delay_ms = int(round(pos_sec * 1000))
                 # adelay expects channel-delays separated by |
                 filter_complex_parts.append(f"[wm{i}]adelay={delay_ms}|{delay_ms},volume={wm_volume}[wm{i}_out]")
                 wm_out_labels.append(f"[wm{i}_out]")
+            
             # combine
             all_inputs = "[main]" + "".join(wm_out_labels)
             amix_inputs = 1 + n_wms
@@ -1560,16 +1622,14 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_for
         if force_reencode and fmt.get("codec") == "copy":
             fmt = {"codec": "aac", "channels": 2, "bitrate": "192k"}
 
+    # If standard mixing fallback needed (rare case)
     elif use_watermark and watermark_local_file and force_reencode:
-        # Fallback for simple mixing (less precise than the main loop but robust)
         args.extend(["-i", watermark_local_file])
         if fmt.get("codec") == "copy":
             fmt = {"codec": "aac", "channels": 2, "bitrate": "192k"}
         audio_map_label = "[aud_out]"
-        filter_complex_parts.append(f"[0:a:{track_index}][1:a]amix=inputs=2:duration=first[aud_out]")
-    else:
-        # no watermark -> map existing audio directly
-        audio_map_label = f"0:a:{track_index}"
+        # FIX: Map specific index here too
+        filter_complex_parts.append(f"[0:{track_index}][1:a]amix=inputs=2:duration=first[aud_out]")
 
     if filter_complex_parts:
         args.extend(["-filter_complex", ";".join(filter_complex_parts)])
@@ -1587,7 +1647,7 @@ async def build_ffmpeg_args(conv, input_file, watermark_local_file, override_for
     args.extend([f"-metadata:s:a:0", f"language={lang}"])
 
     if output_type == "remux":
-        # include video and subtitles if present
+        # include video and subtitles if present (copy them)
         args.extend(["-map", "0:v:0?", "-map", "0:s?"])
         args.extend(["-c:v", "copy", "-c:s", "copy"])
 
@@ -1886,3 +1946,4 @@ if __name__ == "__main__":
         if not loop.is_closed():
             loop.close()
         LOGGER.info("Shutdown complete.")
+
