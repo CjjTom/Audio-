@@ -1281,61 +1281,57 @@ async def track_selection_cb(client, cb: CallbackQuery):
 
     await cb.message.edit_text(f"✅ Track {track_index} selected.\n\nChoose output format:", reply_markup=InlineKeyboardMarkup(buttons))
 
-@bot.on_callback_query(filters.regex(r"^format_(.+)"))
+@bot.on_callback_query(filters.regex(r"^format_(.+)") & admin_filter)
 async def format_selection_cb(client, cb: CallbackQuery):
     await cb.answer()
     chat_id = cb.message.chat.id
     conv = await get_user_conversation(chat_id)
+    
     if not conv or conv.get("stage") != "awaiting_format_selection":
         return await cb.answer("Session expired. Please start over.", show_alert=True)
 
-    raw_choice = cb.data.split("_", 1)[1]
-    # normalize mapping keys used earlier
-    format_choice_map = {
-        "aac_stereo": {"codec": "aac", "channels": 2, "bitrate": "192k"},
-        "aac_5_1": {"codec": "aac", "channels": 6, "bitrate": "320k"},
-        "mp3_stereo": {"codec": "libmp3lame", "channels": 2, "bitrate": "192k"},
-        "aac_copy": {"codec": "copy", "channels": "copy", "bitrate": "copy"},
-    }
-    # map incoming cb values
-    format_choice = raw_choice
-    if format_choice not in format_choice_map:
-        # sometimes cb contained other suffixes; fallback to detect 'copy'
-        if "copy" in format_choice:
-            format_choice = "aac_copy"
-        else:
-            return await cb.answer("Invalid format.", show_alert=True)
+    # Get the data sent by the button (e.g., "aac_stereo", "aac_5_1", "mp3_stereo")
+    raw_choice = cb.data.split("format_")[1]
+    
+    # Default settings
+    fmt_data = {"codec": "aac", "channels": 2, "bitrate": "192k"}
 
-    await update_user_conversation(chat_id, {"format": format_choice_map[format_choice]})
+    # Logic to identify the exact format
+    if "aac_5_1" in raw_choice:
+        fmt_data = {"codec": "aac", "channels": 6, "bitrate": "320k"} # 5.1 Surround
+    elif "mp3" in raw_choice:
+        fmt_data = {"codec": "libmp3lame", "channels": 2, "bitrate": "192k"}
+    elif "copy" in raw_choice:
+        fmt_data = {"codec": "copy", "channels": "copy", "bitrate": "copy"}
+    
+    # Save the selected format
+    await update_user_conversation(chat_id, {"format": fmt_data})
 
+    # Check for Watermark Preference logic
     owner_wm = await get_owner_watermark()
     admin_wm = await get_admin_watermark(cb.from_user.id)
-    # Determine watermark default behavior
     watermark_available = (owner_wm.get("file_id") is not None) or (admin_wm is not None)
-    # If copy mode chosen and watermark requested, we will force re-encode later.
-    if format_choice == "aac_copy":
-        # we allow user to still request watermark, but warn that copy will be overridden
+
+    # If Copy mode is selected, we generally skip watermark or force re-encode
+    if fmt_data["codec"] == "copy":
         await update_user_conversation(chat_id, {"watermark": False})
-        await cb.answer("Copy mode selected. Watermark is not required.", show_alert=True)
-        # proceed to output selection
         await ask_for_output_type(cb, conv)
+    elif watermark_available:
+        # Ask for watermark if available
+        await update_user_conversation(chat_id, {"stage": "awaiting_watermark_selection"})
+        await cb.message.edit_text(
+            "✅ Format selected.\n\nDo you want to mix watermark?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💧 Use Owner Watermark", callback_data="watermark_use_owner")],
+                [InlineKeyboardButton("🧑‍💼 Use My Watermark (Admin)", callback_data="watermark_use_admin")],
+                [InlineKeyboardButton("❌ No Watermark", callback_data="watermark_use_no")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]
+            ])
+        )
     else:
-        # Ask whether to use watermark: default to owner WM if mandatory
-        default_use = bool(Config.OWNER_WATERMARK_MANDATORY and owner_wm.get("file_id"))
-        if watermark_available:
-            await update_user_conversation(chat_id, {"stage": "awaiting_watermark_selection"})
-            await cb.message.edit_text(
-                "✅ Format selected.\n\nDo you want to mix watermark?",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💧 Use Owner Watermark", callback_data="watermark_use_owner")],
-                    [InlineKeyboardButton("🧑‍💼 Use My Watermark (Admin)", callback_data="watermark_use_admin")],
-                    [InlineKeyboardButton("❌ No Watermark", callback_data="watermark_use_no")],
-                    [InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]
-                ])
-            )
-        else:
-            await update_user_conversation(chat_id, {"watermark": False})
-            await ask_for_output_type(cb, conv)
+        # No watermark available, proceed directly
+        await update_user_conversation(chat_id, {"watermark": False})
+        await ask_for_output_type(cb, conv)
 
 @bot.on_callback_query(filters.regex(r"^watermark_use_(owner|admin|no)$") & admin_filter)
 async def watermark_selection_cb(client, cb: CallbackQuery):
