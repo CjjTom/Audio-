@@ -871,7 +871,7 @@ async def owner_pos_done_cb(client, cb: CallbackQuery):
 async def admin_wm_positions_cb(client, cb: CallbackQuery):
     await cb.answer()
     admin_wm = await get_admin_watermark(cb.from_user.id) or {"positions":["start","end"]}
-    current = set(admin_wm.get("positions", ["start","end"])}
+    current = set(admin_wm.get("positions", ["start","end"]))
     def mk_btn(name, label=None):
         mark = "✅" if name in current else "❌"
         shown = label if label else name.capitalize()
