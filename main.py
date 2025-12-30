@@ -18,9 +18,9 @@ from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, MessageIdInvalid, MessageNotModified
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
-# ------------------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
 # CONFIGURATION
-# ------------------------------------------------------------------------------ #
+# ----------------------------------------------------------------------------
 
 load_dotenv()
 
