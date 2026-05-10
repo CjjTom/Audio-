@@ -2299,7 +2299,7 @@ async def start_conversion_process(cb: CallbackQuery):
 
                 codec_lbl = (out_fmt or local_conv.get('format', {})).get('codec', '?')
                 wm_flag = local_conv.get('watermark') and wm_info.get('applied')
-                                caption = (
+                caption = (
                     f'✅ **Conversion Complete!**
 
 '
@@ -2308,14 +2308,23 @@ async def start_conversion_process(cb: CallbackQuery):
                     f'Watermark: `{("Yes – " + wm_info.get("which", "")) if wm_flag else "No"}`
 '
                 )
+
                 if wm_flag:
                     caption += (
-                        f'Positions: `{", ".join(wm_info.get("positions") or [])}`\n'
-                        f'Volume: `{int(wm_info.get("volume", 0.2) * 100)}%`\n'
+                        f'Positions: `{", ".join(wm_info.get("positions") or [])}`
+'
+                        f'Volume: `{int(wm_info.get("volume", 0.2) * 100)}%`
+'
                     )
-                caption += f'Output Size: `{human_size(out_size)}`\nJob ID: `{job_id}`'
+                caption += (
+                    f'Output Size: `{human_size(out_size)}`
+'
+                    f'Job ID: `{job_id}`'
+                )
 
-                await status_msg.edit_text('✅ **Converting Complete!**\n\nUploading…')
+                await status_msg.edit_text('✅ **Converting Complete!**
+
+Uploading…')
                 await bot.send_document(
                     chat_id,
                     document=final_output,
