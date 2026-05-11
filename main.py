@@ -795,18 +795,14 @@ async def run_ffmpeg(args: list, total_secs: float, status_msg, job_id: str) -> 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FFMPEG ARGS BUILDER
 #
-# Lip-sync guarantee — lightweight approach:
+# Lightweight approach:
 # ──────────────────────────────────────────
 # • -ar 48000 on the encoded stream ensures a fixed, known sample rate.
-# • adelay=<ms>:all=1 uses sample-accurate integer-ms delay applied to ALL
-#   channels, avoiding channel-layout mismatch.
-# • amix=duration=longest:dropout_transition=0 keeps the main track's full
-#   length; watermark copies are padded with `apad` so amix never clips.
-# • afade is applied with sample-accurate st= timing relative to each
-#   watermark instance.
-# • For remux: -c:v copy -c:s copy  (no -vsync, no -avoid_negative_ts).
-#   These global flags caused massive buffering in muxers on low-RAM servers.
-# • No dynaudnorm, no heavy aresample chains.
+# • adelay is used for precise watermark placement.
+# • amix=duration=first ensures the process stops exactly when the main audio finishes.
+# • afade is applied with sample-accurate st= timing relative to each watermark.
+# • For remux: -c:v copy -c:s copy (no -vsync, no -avoid_negative_ts).
+# • No dynaudnorm, no heavy aresample chains, no apad.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 WM_START_OFFSET = 180.0   # place "start" watermark 3 min in
@@ -919,7 +915,7 @@ async def build_ffmpeg_args(
             filter_parts.append(f"[0:{track_index}]anull[main]")
 
             for i, pos_s in enumerate(positions):
-                delay_ms = pos_s * 1000
+                delay_ms = int(pos_s * 1000)
                 # Build per-instance chain
                 chain = f"volume={wm_volume:.4f}"
                 if fade_duration > 0:
@@ -929,17 +925,17 @@ async def build_ffmpeg_args(
                     # fade out at end of wm clip
                     out_t = max(0.0, wm_dur - fd)
                     chain = f"{chain},afade=t=out:st={out_t:.3f}:d={fd:.3f}"
-                # adelay:all=1 → sample-accurate, all channels
-                # apad → ensure amix never truncates main
+                
+                # Old code logic: No apad, simple adelay
                 filter_parts.append(
-                    f"[wm{i}]{chain},adelay={int(delay_ms)}:all=1,apad[wm{i}_out]"
+                    f"[wm{i}]{chain},adelay={delay_ms}|{delay_ms}[wm{i}_out]"
                 )
 
             inputs    = "[main]" + "".join(f"[wm{i}_out]" for i in range(n))
             n_inputs  = 1 + n
-            # duration=longest → main track length is always preserved exactly
+            # Old code logic: duration=first
             filter_parts.append(
-                f"{inputs}amix=inputs={n_inputs}:duration=longest:dropout_transition=0[aud_out]"
+                f"{inputs}amix=inputs={n_inputs}:duration=first[aud_out]"
             )
             audio_out_lbl = "[aud_out]"
         else:
@@ -953,7 +949,8 @@ async def build_ffmpeg_args(
         audio_out_lbl = "[aud_out]"
 
     # Apply filter_complex
-    args.extend(["-filter_complex", ";".join(filter_parts)])
+    if filter_parts:
+        args.extend(["-filter_complex", ";".join(filter_parts)])
 
     # Map processed audio
     args.extend(["-map", audio_out_lbl])
@@ -969,7 +966,7 @@ async def build_ffmpeg_args(
             "-c:a",  fmt["codec"],
             "-b:a",  fmt.get("bitrate", "192k"),
             "-ac",   str(fmt.get("channels", 2)),
-            "-ar",   "48000",   # fixed sample rate — key for lip-sync
+            "-ar",   "48000",   # fixed sample rate
         ])
 
     # ── Default metadata ──────────────────────────────────────────────────────
