@@ -2703,9 +2703,10 @@ async def _pinger():
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
+from pyrogram import idle
 
 async def _main():
-    LOGGER.info("Starting bot…")
+    LOGGER.info("Starting bot...")
     await bot.start()
     me = await bot.get_me()
     LOGGER.info(f"Logged in as @{me.username}")
@@ -2724,15 +2725,15 @@ async def _main():
     except Exception as e:
         LOGGER.warning(f"Startup message: {e}")
 
-    await asyncio.Event().wait()   # block forever
-
+    # Use Pyrogram's idle instead of Event().wait() for better stability
+    await idle()
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # FIX: Get the existing event loop that the bot is already attached to
+    loop = asyncio.get_event_loop()
 
     async def _shutdown(sig_name: str):
-        LOGGER.info(f"Signal {sig_name} — shutting down…")
+        LOGGER.info(f"Signal {sig_name} — shutting down...")
         if bot.is_connected:
             await bot.stop()
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
@@ -2752,11 +2753,10 @@ if __name__ == "__main__":
 
     try:
         loop.run_until_complete(_main())
-        loop.run_forever()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        LOGGER.info("Cleaning up…")
+        LOGGER.info("Cleaning up...")
         try:
             if os.path.isdir(Config.DOWNLOAD_DIR):
                 shutil.rmtree(Config.DOWNLOAD_DIR, ignore_errors=True)
